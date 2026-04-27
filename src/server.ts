@@ -206,6 +206,51 @@ function getStore(): ContentStore {
 }
 
 // ─────────────────────────────────────────────────────────
+// Global persistent knowledge base
+// ─────────────────────────────────────────────────────────
+
+let _kbStore: ContentStore | null = null;
+let _kbStoreInitialized = false;
+
+/**
+ * Resolve ~ in path (Node doesn't expand ~ automatically)
+ */
+function resolveKbPath(rawPath: string): string {
+  return rawPath.startsWith("~") ? join(homedir(), rawPath.slice(1)) : rawPath;
+}
+
+/**
+ * Returns the global KB ContentStore.
+ * Default path: ~/.context-mode/knowledge.db
+ * Override via CONTEXT_MODE_KNOWLEDGE_DB env var.
+ * Never cleaned up by age — knowledge base is permanent.
+ */
+/** @internal — test use only */
+export function _resetKbStore(): void {
+  _kbStore = null;
+  _kbStoreInitialized = false;
+}
+
+export function getKbStore(): ContentStore | null {
+  if (_kbStoreInitialized) return _kbStore;
+  _kbStoreInitialized = true;
+
+  const rawPath = process.env.CONTEXT_MODE_KNOWLEDGE_DB
+    ?? join(homedir(), ".context-mode", "knowledge.db");
+
+  try {
+    const kbPath = resolveKbPath(rawPath);
+    mkdirSync(dirname(kbPath), { recursive: true });
+    _kbStore = new ContentStore(kbPath);
+  } catch (err) {
+    process.stderr.write(`[context-mode] KB store init failed: ${err}\n`);
+    _kbStore = null;
+  }
+
+  return _kbStore;
+}
+
+// ─────────────────────────────────────────────────────────
 // Session stats — track context consumption per tool
 // ─────────────────────────────────────────────────────────
 
