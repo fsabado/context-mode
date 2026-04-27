@@ -2297,6 +2297,59 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
 );
 
 // ─────────────────────────────────────────────────────────
+// Tool: ctx_kb_index — global persistent knowledge base indexing
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "ctx_kb_index",
+  {
+    title: "Index into Knowledge Base",
+    description:
+      "Index content into the GLOBAL PERSISTENT knowledge base. " +
+      "Content persists across ALL sessions — use for codebases, docs, and skills you want always available.\n\n" +
+      "Unlike ctx_index (session-only, ephemeral), this survives session restarts.\n\n" +
+      "WHEN TO USE:\n" +
+      "- Indexing a repo you want searchable in all future sessions\n" +
+      "- Adding reference docs to a permanent library\n\n" +
+      "After indexing, use ctx_kb_search() to query.",
+    inputSchema: z.object({
+      content: z.string().optional().describe("Raw text/markdown to index. Provide this OR path, not both."),
+      path: z.string().optional().describe("File path to read and index (content never enters context). Provide this OR content."),
+      source: z.string().describe("Label for the indexed content (e.g., 'lyft/etl', 'ai-skills')"),
+    }),
+  },
+  async ({ content, path, source }) => {
+    if (!content && !path) {
+      return trackResponse("ctx_kb_index", {
+        content: [{ type: "text" as const, text: "Error: Either content or path must be provided" }],
+        isError: true,
+      });
+    }
+    const kb = getKbStore();
+    if (!kb) {
+      return trackResponse("ctx_kb_index", {
+        content: [{ type: "text" as const, text: "Knowledge base not available. Check CONTEXT_MODE_KNOWLEDGE_DB env var." }],
+        isError: true,
+      });
+    }
+    try {
+      const result = kb.index({ content, path, source });
+      return trackResponse("ctx_kb_index", {
+        content: [{
+          type: "text" as const,
+          text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse ctx_kb_search(queries: ["..."]) to query. Use source: "${result.label}" to scope results.`,
+        }],
+      });
+    } catch (err: unknown) {
+      return trackResponse("ctx_kb_index", {
+        content: [{ type: "text" as const, text: `KB index error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────
 // Tool: search — progressive throttling
 // ─────────────────────────────────────────────────────────
 
