@@ -2690,6 +2690,64 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
 );
 
 // ─────────────────────────────────────────────────────────
+// Tool: ctx_kb_search — global persistent knowledge base search
+// ─────────────────────────────────────────────────────────
+
+server.registerTool(
+  "ctx_kb_search",
+  {
+    title: "Search Knowledge Base",
+    description:
+      "Search the GLOBAL PERSISTENT knowledge base — codebases, docs, and skills indexed via ctx_kb_index or CLI.\n\n" +
+      "Use this (NOT ctx_search) when looking for:\n" +
+      "- Lyft repos (lyft/etl, lyft/ads, lyft/skills, etc.)\n" +
+      "- ai-skills, linux-env configs\n" +
+      "- Any content indexed with ctx_kb_index\n\n" +
+      "Use ctx_search for content indexed THIS session only.",
+    inputSchema: z.object({
+      queries: z.array(z.string()).min(1).max(8).describe("Search queries (1-8). Use varied phrasing for broader coverage."),
+      source: z.string().optional().describe("Optional: scope results to a specific source label (e.g., 'lyft/etl')"),
+    }),
+  },
+  async ({ queries, source }) => {
+    const kb = getKbStore();
+    if (!kb) {
+      return trackResponse("ctx_kb_search", {
+        content: [{ type: "text" as const, text: "Knowledge base not configured. Run: context-mode kb-index --path <file> --source <label>" }],
+      });
+    }
+    const stats = kb.getStats();
+    if (stats.chunks === 0) {
+      return trackResponse("ctx_kb_search", {
+        content: [{ type: "text" as const, text: "Knowledge base is empty.\nPopulate it with: context-mode kb-index --path <file> --source <label>" }],
+      });
+    }
+    const allResults: SearchResult[] = [];
+    for (const query of queries) {
+      const results = kb.searchWithFallback(query, 5, source ?? undefined);
+      allResults.push(...results);
+    }
+    const seen = new Set<string>();
+    const deduped = allResults.filter(r => {
+      const key = `${r.source}::${r.title}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (deduped.length === 0) {
+      return trackResponse("ctx_kb_search", {
+        content: [{ type: "text" as const, text: `No results in knowledge base for: ${queries.join(", ")}` }],
+      });
+    }
+    const sections = deduped.map(r => `--- [${r.source}] ---\n### ${r.title}\n\n${r.content}`);
+    const output = queries.map((q, i) => i === 0 ? `## ${q}\n\n${sections.join("\n\n---\n\n")}` : `## ${q}`).join("\n\n");
+    return trackResponse("ctx_kb_search", {
+      content: [{ type: "text" as const, text: output }],
+    });
+  },
+);
+
+// ─────────────────────────────────────────────────────────
 // Turndown path resolution (external dep, like better-sqlite3)
 // ─────────────────────────────────────────────────────────
 
