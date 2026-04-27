@@ -29,6 +29,7 @@ import {
 
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
+import { ContentStore } from "./store.js";
 import type { HookAdapter } from "./adapters/types.js";
 
 /* -------------------------------------------------------
@@ -119,6 +120,8 @@ if (args[0] === "doctor") {
   hookDispatch(args[1], args[2]);
 } else if (args[0] === "insight") {
   insight(args[1] ? Number(args[1]) : 4747);
+} else if (["search", "kb-search", "index", "kb-index", "stats", "sources"].includes(args[0] ?? "")) {
+  runKbCmd(args[0]);
 } else {
   // Default: start MCP server
   import("./server.js");
@@ -842,5 +845,180 @@ async function upgrade() {
       color.yellow("Doctor had warnings") +
         color.dim(` — restart your ${adapter.name} session to pick up the new version`),
     );
+  }
+}
+
+// ── CLI subcommands: search, index, stats, sources ───────────────────────────
+
+function getCliFlag(name: string): string | null {
+  const idx = process.argv.indexOf(name);
+  return idx !== -1 && process.argv[idx + 1] && !process.argv[idx + 1]!.startsWith("--")
+    ? process.argv[idx + 1]!
+    : null;
+}
+
+function hasCliFlag(name: string): boolean {
+  return process.argv.includes(name);
+}
+
+function resolveKbPathCli(rawPath: string): string {
+  return rawPath.startsWith("~") ? join(homedir(), rawPath.slice(1)) : rawPath;
+}
+
+function runKbCmd(cmd: string): void {
+  const isJson = hasCliFlag("--json");
+  const useSession = hasCliFlag("--session");
+
+  function openKbStore(): ContentStore {
+    const rawPath =
+      process.env.CONTEXT_MODE_KNOWLEDGE_DB ??
+      join(homedir(), ".context-mode", "knowledge.db");
+    const kbPath = resolveKbPathCli(rawPath);
+    mkdirSync(dirname(kbPath), { recursive: true });
+    return new ContentStore(kbPath);
+  }
+
+  function openStore(): ContentStore {
+    return useSession
+      ? new ContentStore(join(tmpdir(), `context-mode-cli-${process.pid}.db`))
+      : openKbStore();
+  }
+
+  if (cmd === "search" || cmd === "kb-search") {
+    const query = getCliFlag("--query") ?? getCliFlag("-q");
+    const source = getCliFlag("--source") ?? getCliFlag("-s");
+    if (!query) {
+      console.error("Error: --query required");
+      process.exit(1);
+    }
+
+    const store = openStore();
+    const results = store.searchWithFallback(query, 10, source ?? undefined);
+    store.close();
+
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            results: results.map((r) => ({
+              title: r.title,
+              content: r.content,
+              source: r.source,
+              rank: r.rank,
+              contentType: r.contentType,
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      if (results.length === 0) {
+        console.log("No results found.");
+      } else {
+        for (const r of results) {
+          console.log(`\n--- [${r.source}] ---`);
+          console.log(`### ${r.title}\n`);
+          console.log(r.content);
+        }
+      }
+    }
+    process.exit(0);
+  }
+
+  if (cmd === "index" || cmd === "kb-index") {
+    const filePath = getCliFlag("--path");
+    const content = getCliFlag("--content");
+    const source = getCliFlag("--source") ?? getCliFlag("-s");
+    if (!filePath && !content) {
+      console.error("Error: --path or --content required");
+      process.exit(1);
+    }
+    if (!source) {
+      console.error("Error: --source required");
+      process.exit(1);
+    }
+
+    const store = openStore();
+    const result = store.index({
+      path: filePath ?? undefined,
+      content: content ?? undefined,
+      source,
+    });
+    store.close();
+
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            source: result.label,
+            totalChunks: result.totalChunks,
+            codeChunks: result.codeChunks,
+            sourceId: result.sourceId,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(
+        `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}`,
+      );
+    }
+    process.exit(0);
+  }
+
+  if (cmd === "stats") {
+    let store: ContentStore | null = null;
+    try {
+      store = openStore();
+    } catch {
+      /* empty KB — store stays null */
+    }
+    const stats = store?.getStats() ?? { sources: 0, chunks: 0, codeChunks: 0 };
+    const dbSizeBytes = store?.getDBSizeBytes() ?? 0;
+    const rawPath =
+      process.env.CONTEXT_MODE_KNOWLEDGE_DB ??
+      join(homedir(), ".context-mode", "knowledge.db");
+    const dbPath = useSession
+      ? "session"
+      : resolveKbPathCli(rawPath);
+    store?.close();
+
+    if (isJson) {
+      console.log(JSON.stringify({ ...stats, dbSizeBytes, dbPath }, null, 2));
+    } else {
+      console.log(
+        `Sources: ${stats.sources}  Chunks: ${stats.chunks}  Code: ${stats.codeChunks}`,
+      );
+      console.log(
+        `DB: ${dbPath} (${Math.round((dbSizeBytes / 1024 / 1024) * 10) / 10}MB)`,
+      );
+    }
+    process.exit(0);
+  }
+
+  if (cmd === "sources") {
+    let store: ContentStore | null = null;
+    try {
+      store = openStore();
+    } catch {
+      /* empty KB */
+    }
+    const sources = store?.listSources() ?? [];
+    store?.close();
+
+    if (isJson) {
+      console.log(JSON.stringify({ sources }, null, 2));
+    } else {
+      if (sources.length === 0) {
+        console.log("Knowledge base is empty.");
+      } else {
+        for (const s of sources) {
+          console.log(`${s.label} (${s.chunkCount} chunks)`);
+        }
+      }
+    }
+    process.exit(0);
   }
 }
