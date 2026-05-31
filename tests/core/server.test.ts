@@ -6514,7 +6514,9 @@ describe("ctx_stats cache observability + index_state (issue #697)", () => {
     expect(typeof state.lastIndexedAt).toBe("string");
   });
 
-  test("AnalyticsEngine exposes cache_hit_rate computed from hits + misses", async () => {
+  test("AnalyticsEngine exposes cache_hit_rate computed from hits + misses (no Observability rendering)", async () => {
+    // hit_rate is still computed correctly on the report; we just don't render
+    // the machine-readable Observability block in ctx_stats output any more.
     const { AnalyticsEngine, formatReport } = await import("../../src/session/analytics.js");
     const Database = (await import("better-sqlite3")).default;
     const sdb = new Database(":memory:");
@@ -6539,69 +6541,21 @@ describe("ctx_stats cache observability + index_state (issue #697)", () => {
     expect(report.cache?.misses).toBe(1);
     expect(report.cache?.hit_rate).toBeCloseTo(0.75, 5);
 
-    const text = formatReport(report, "0.0.0-test", null, {
+    // formatReport MUST NOT emit the Observability block any longer — neither
+    // on the narrative path nor on the legacy path, regardless of whether
+    // indexState is passed.
+    const textLegacy = formatReport(report, "0.0.0-test", null, {
       indexState: { totalChunks: 42, totalSources: 7, lastIndexedAt: "2026-05-24T12:00:00" },
     });
-    expect(text).toContain("## Observability");
-    expect(text).toContain("cache.hit_rate: 75.0%");
-    expect(text).toContain("index.total_chunks: 42");
-    expect(text).toContain("index.total_sources: 7");
-    expect(text).toContain("index.last_indexed_at: 2026-05-24T12:00:00");
-  });
+    expect(textLegacy).not.toContain("## Observability");
+    expect(textLegacy).not.toContain("cache.hit_rate:");
+    expect(textLegacy).not.toContain("index.total_chunks");
+    expect(textLegacy).not.toContain("index.total_sources");
+    expect(textLegacy).not.toContain("index.last_indexed_at");
 
-  test("Observability section is omitted when no cache activity and no index_state", async () => {
-    const { AnalyticsEngine, formatReport } = await import("../../src/session/analytics.js");
-    const Database = (await import("better-sqlite3")).default;
-    const sdb = new Database(":memory:");
-    sdb.exec(`
-      CREATE TABLE session_meta (session_id TEXT PRIMARY KEY, started_at TEXT, compact_count INTEGER DEFAULT 0);
-      CREATE TABLE session_events (id INTEGER PRIMARY KEY, session_id TEXT, category TEXT, type TEXT, data TEXT, created_at TEXT);
-      CREATE TABLE session_resume (id INTEGER PRIMARY KEY, session_id TEXT, event_count INTEGER, consumed INTEGER, created_at TEXT);
-    `);
-    const engine = new AnalyticsEngine(sdb);
-    const report = engine.queryAll({
-      bytesReturned: {},
-      bytesIndexed: 0,
-      bytesSandboxed: 0,
-      calls: {},
-      sessionStart: Date.now() - 60_000,
-      cacheHits: 0,
-      cacheMisses: 0,
-      cacheBytesSaved: 0,
-    });
-    const text = formatReport(report, "0.0.0-test", null);
-    expect(text).not.toContain("## Observability");
-  });
-
-  test("Observability block surfaces in the narrative path (conversation.events > 0 + indexState)", async () => {
-    // Regression: formatReport early-returns when conversation.events > 0 to
-    // emit the 5-section narrative renderer. The Observability append used to
-    // live AFTER that return, so cache.hit_rate / index.* never rendered for
-    // the normal ctx_stats path that always passes both `conversation` and
-    // `indexState`. Fix: render via shared helper called from both paths.
-    const { AnalyticsEngine, formatReport } = await import("../../src/session/analytics.js");
-    const Database = (await import("better-sqlite3")).default;
-    const sdb = new Database(":memory:");
-    sdb.exec(`
-      CREATE TABLE session_meta (session_id TEXT PRIMARY KEY, started_at TEXT, compact_count INTEGER DEFAULT 0);
-      CREATE TABLE session_events (id INTEGER PRIMARY KEY, session_id TEXT, category TEXT, type TEXT, data TEXT, created_at TEXT);
-      CREATE TABLE session_resume (id INTEGER PRIMARY KEY, session_id TEXT, event_count INTEGER, consumed INTEGER, created_at TEXT);
-    `);
-    const engine = new AnalyticsEngine(sdb);
-    const report = engine.queryAll({
-      bytesReturned: {},
-      bytesIndexed: 0,
-      bytesSandboxed: 0,
-      calls: {},
-      sessionStart: Date.now() - 60_000,
-      cacheHits: 3,
-      cacheMisses: 1,
-      cacheBytesSaved: 1024,
-    });
-
-    // Conversation with events > 0 triggers the narrative early-return path.
+    // Same expectation on the narrative early-return path.
     const conversation = {
-      sessionId: "observability-narrative-test",
+      sessionId: "observability-removed-narrative-test",
       events: 12,
       dbCount: 1,
       daysAlive: 1.5,
@@ -6611,22 +6565,18 @@ describe("ctx_stats cache observability + index_state (issue #697)", () => {
       firstEventMs: Date.now() - 86_400_000,
       lastEventMs: Date.now(),
     };
-
-    const text = formatReport(report, "0.0.0-test", null, {
+    const textNarrative = formatReport(report, "0.0.0-test", null, {
       conversation: conversation as any,
       indexState: { totalChunks: 42, totalSources: 7, lastIndexedAt: "2026-05-24T12:00:00" },
-      // Deterministic narrative renderer inputs so the test is byte-stable.
       cwd: "/test/repo",
       now: 1716552000000,
       locale: "en-US",
       tz: "UTC",
     });
-
-    // Both cache.* and index.* must surface despite the narrative early-return.
-    expect(text).toContain("## Observability");
-    expect(text).toContain("cache.hit_rate: 75.0%");
-    expect(text).toContain("index.total_chunks: 42");
-    expect(text).toContain("index.total_sources: 7");
-    expect(text).toContain("index.last_indexed_at: 2026-05-24T12:00:00");
+    expect(textNarrative).not.toContain("## Observability");
+    expect(textNarrative).not.toContain("cache.hit_rate:");
+    expect(textNarrative).not.toContain("index.total_chunks");
+    expect(textNarrative).not.toContain("index.total_sources");
+    expect(textNarrative).not.toContain("index.last_indexed_at");
   });
 });
