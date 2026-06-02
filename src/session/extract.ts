@@ -1091,17 +1091,168 @@ function extractExternalRef(input: HookInput): SessionEvent[] {
 
 /**
  * Category 8: env (worktree)
- * EnterWorktree tool — tracks worktree creation.
+ * EnterWorktree + ExitWorktree tools — tracks worktree lifecycle.
  */
 function extractWorktree(input: HookInput): SessionEvent[] {
-  if (input.tool_name !== "EnterWorktree") return [];
+  if (input.tool_name === "EnterWorktree") {
+    const name = String(input.tool_input["name"] ?? "unnamed");
+    return [{
+      type: "worktree",
+      category: "env",
+      data: safeString(`entered worktree: ${name}`),
+      priority: 2,
+    }];
+  }
 
-  const name = String(input.tool_input["name"] ?? "unnamed");
+  if (input.tool_name === "ExitWorktree") {
+    const discard = Boolean(input.tool_input["discard_changes"]);
+    return [{
+      type: "worktree_exit",
+      category: "env",
+      data: safeString(`exited worktree (discard_changes:${discard})`),
+      priority: 2,
+    }];
+  }
+
+  return [];
+}
+
+/**
+ * Algorithmic URL host extraction — no regex.
+ * Skips scheme, returns everything up to the first path/query/fragment marker.
+ * Port is preserved as part of the host signature.
+ */
+function extractHostFromUrl(url: string): string | null {
+  if (typeof url !== "string" || url.length === 0) return null;
+  const protoEnd = url.indexOf("://");
+  if (protoEnd < 0) return null;
+  const start = protoEnd + 3;
+  if (start >= url.length) return null;
+  let end = url.length;
+  for (let i = start; i < url.length; i++) {
+    const c = url.charCodeAt(i);
+    if (c === 47 || c === 63 || c === 35) { end = i; break; }
+  }
+  const host = url.slice(start, end);
+  return host.length > 0 ? host : null;
+}
+
+/**
+ * WebFetch response metadata — captures bytes/code/durationMs and host
+ * (privacy: never the full URL or query string). Redirect-loop detection
+ * is temporal, not single-field — SDK has no redirect_url.
+ */
+function extractWebFetchMetadata(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "WebFetch") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const obj = parsed as Record<string, unknown>;
+  const parts: string[] = [];
+
+  if (typeof obj.code === "number") parts.push(`code:${obj.code}`);
+  if (typeof obj.bytes === "number") parts.push(`bytes:${obj.bytes}`);
+  if (typeof obj.durationMs === "number") parts.push(`durMs:${obj.durationMs}`);
+  if (typeof obj.url === "string") {
+    const host = extractHostFromUrl(obj.url);
+    if (host) parts.push(`host:${host}`);
+  }
+
+  if (parts.length === 0) return [];
+
   return [{
-    type: "worktree",
-    category: "env",
-    data: safeString(`entered worktree: ${name}`),
-    priority: 2,
+    type: "webfetch_metadata",
+    category: "data",
+    data: safeString(parts.join(" ")),
+    priority: 3,
+  }];
+}
+
+/**
+ * Bash outcome signals — captures the three fields that DO exist on
+ * BashOutput (SDK :2160-2200): interrupted (boolean), stderr (length-only
+ * for privacy), returnCodeInterpretation (semantic non-zero exit hint).
+ * NO exit_code field exists in the SDK.
+ */
+function extractBashOutcome(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "Bash") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const obj = parsed as Record<string, unknown>;
+  const hasSignal =
+    typeof obj.interrupted === "boolean" ||
+    typeof obj.stderr === "string" ||
+    typeof obj.returnCodeInterpretation === "string";
+  if (!hasSignal) return [];
+
+  const parts: string[] = [];
+  if (typeof obj.interrupted === "boolean") {
+    parts.push(`interrupted:${obj.interrupted}`);
+  }
+  if (typeof obj.returnCodeInterpretation === "string") {
+    parts.push(`rcInterp:${obj.returnCodeInterpretation.slice(0, 80)}`);
+  }
+  if (typeof obj.stderr === "string") {
+    parts.push(`stderrBytes:${obj.stderr.length}`);
+  }
+
+  return [{
+    type: "bash_outcome",
+    category: "data",
+    data: safeString(parts.join(" ")),
+    priority: 3,
+  }];
+}
+
+/**
+ * FileReadOutput size metadata — branches on the text/image variant.
+ * Captures sizes/line counts only; never file content. Image dimensions
+ * are formatted as "WxH" when both width/height are numeric.
+ */
+function extractFileReadMetadata(input: HookInput): SessionEvent[] {
+  if (input.tool_name !== "Read") return [];
+  const resp = input.tool_response;
+  if (typeof resp !== "string" || resp.length === 0) return [];
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(resp); } catch { return []; }
+  if (!parsed || typeof parsed !== "object") return [];
+
+  const obj = parsed as Record<string, unknown>;
+  const variant = obj.type;
+  if (variant !== "text" && variant !== "image") return [];
+
+  const parts: string[] = [`type:${variant}`];
+
+  if (variant === "text") {
+    if (typeof obj.numLines === "number") parts.push(`lines:${obj.numLines}`);
+    if (typeof obj.totalLines === "number") parts.push(`totalLines:${obj.totalLines}`);
+    if (typeof obj.startLine === "number") parts.push(`start:${obj.startLine}`);
+  } else {
+    if (typeof obj.originalSize === "number") parts.push(`origSize:${obj.originalSize}`);
+    const dims = obj.dimensions;
+    if (dims && typeof dims === "object") {
+      const d = dims as Record<string, unknown>;
+      if (typeof d.width === "number" && typeof d.height === "number") {
+        parts.push(`dims:${d.width}x${d.height}`);
+      }
+    }
+  }
+
+  return [{
+    type: "file_read_metadata",
+    category: "data",
+    data: safeString(parts.join(" ")),
+    priority: 3,
   }];
 }
 
@@ -1566,6 +1717,9 @@ export function extractEvents(rawInput: HookInput): SessionEvent[] {
     events.push(...extractDecision(input));
     events.push(...extractConstraint(input));
     events.push(...extractWorktree(input));
+    events.push(...extractWebFetchMetadata(input));
+    events.push(...extractBashOutcome(input));
+    events.push(...extractFileReadMetadata(input));
     events.push(...extractAgentFinding(input));
     events.push(...extractExternalRef(input));
 
