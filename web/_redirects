@@ -1,6 +1,0 @@
-# Cloudflare Pages fallback router (if not deploying via worker.js).
-# Root and /insights both serve the Insights Solution landing.
-# /oss serves the open-source plugin landing.
-/             /insights.html   200
-/insights     /insights.html   200
-/oss          /index.html      200
