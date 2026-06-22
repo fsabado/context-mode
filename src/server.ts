@@ -2304,14 +2304,23 @@ server.registerTool(
   "ctx_kb_index",
   {
     title: "Index into Knowledge Base",
-    description:
-      "Index content into the GLOBAL PERSISTENT knowledge base. " +
-      "Content persists across ALL sessions — use for codebases, docs, and skills you want always available.\n\n" +
-      "Unlike ctx_index (session-only, ephemeral), this survives session restarts.\n\n" +
-      "WHEN TO USE:\n" +
-      "- Indexing a repo you want searchable in all future sessions\n" +
-      "- Adding reference docs to a permanent library\n\n" +
-      "After indexing, use ctx_kb_search() to query.",
+    description: `Index content into the GLOBAL PERSISTENT knowledge base. Content persists across ALL sessions — use for codebases, docs, and skills you want always available.
+
+Unlike ctx_index (session-only, ephemeral), this survives session restarts.
+
+WHEN:
+- You want content available in ALL future sessions (not just this one)
+- Indexing a codebase, docs, or skill set you reference repeatedly
+
+WHEN NOT:
+- Temporary session content — use ctx_index instead
+- Content you only need for the current conversation
+
+RETURNS:
+  Indexing metadata: chunk counts, source label, and a ctx_kb_search call shape to query the content.
+
+EXAMPLE: ctx_kb_index(path: "/path/to/repo", source: "lyft/etl")
+EXAMPLE: ctx_kb_index(content: "# My docs\n...", source: "ai-skills")`,
     inputSchema: z.object({
       content: z.string().optional().describe("Raw text/markdown to index. Provide this OR path, not both."),
       path: z.string().optional().describe("File path to read and index (content never enters context). Provide this OR content."),
@@ -2697,13 +2706,21 @@ server.registerTool(
   "ctx_kb_search",
   {
     title: "Search Knowledge Base",
-    description:
-      "Search the GLOBAL PERSISTENT knowledge base — codebases, docs, and skills indexed via ctx_kb_index or CLI.\n\n" +
-      "Use this (NOT ctx_search) when looking for:\n" +
-      "- Lyft repos (lyft/etl, lyft/ads, lyft/skills, etc.)\n" +
-      "- ai-skills, linux-env configs\n" +
-      "- Any content indexed with ctx_kb_index\n\n" +
-      "Use ctx_search for content indexed THIS session only.",
+    description: `Search the GLOBAL PERSISTENT knowledge base — codebases, docs, and skills indexed via ctx_kb_index or CLI.
+
+WHEN:
+- Looking for content indexed across sessions (repos, docs, skills)
+- Querying Lyft repos (lyft/etl, lyft/ads, lyft/skills, etc.)
+- Finding ai-skills, linux-env configs, or any ctx_kb_index content
+
+WHEN NOT:
+- Content indexed only this session — use ctx_search instead
+
+RETURNS:
+  Per-query ranked sections with window-extracted snippets. Use source: "<label>" to scope to one indexed source.
+
+EXAMPLE: ctx_kb_search(queries: ["auth flow", "token refresh"], source: "lyft/etl")
+EXAMPLE: ctx_kb_search(queries: ["useEffect cleanup"])`,
     inputSchema: z.object({
       queries: z.array(z.string()).min(1).max(8).describe("Search queries (1-8). Use varied phrasing for broader coverage."),
       source: z.string().optional().describe("Optional: scope results to a specific source label (e.g., 'lyft/etl')"),

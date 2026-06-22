@@ -1034,11 +1034,20 @@ Use ctx_search(queries: ["..."]) to query this content. Use source: "${p.label}"
 
 Unlike ctx_index (session-only, ephemeral), this survives session restarts.
 
-WHEN TO USE:
-- Indexing a repo you want searchable in all future sessions
-- Adding reference docs to a permanent library
+WHEN:
+- You want content available in ALL future sessions (not just this one)
+- Indexing a codebase, docs, or skill set you reference repeatedly
 
-After indexing, use ctx_kb_search() to query.`,inputSchema:M.object({content:M.string().optional().describe("Raw text/markdown to index. Provide this OR path, not both."),path:M.string().optional().describe("File path to read and index (content never enters context). Provide this OR content."),source:M.string().describe("Label for the indexed content (e.g., 'lyft/etl', 'ai-skills')")})},async({content:t,path:e,source:r})=>{if(!t&&!e)return F("ctx_kb_index",{content:[{type:"text",text:"Error: Either content or path must be provided"}],isError:!0});let n=V_();if(!n)return F("ctx_kb_index",{content:[{type:"text",text:"Knowledge base not available. Check CONTEXT_MODE_KNOWLEDGE_DB env var."}],isError:!0});try{let o=n.index({content:t,path:e,source:r});return F("ctx_kb_index",{content:[{type:"text",text:`Indexed ${o.totalChunks} sections (${o.codeChunks} with code) from: ${o.label}
+WHEN NOT:
+- Temporary session content \u2014 use ctx_index instead
+- Content you only need for the current conversation
+
+RETURNS:
+  Indexing metadata: chunk counts, source label, and a ctx_kb_search call shape to query the content.
+
+EXAMPLE: ctx_kb_index(path: "/path/to/repo", source: "lyft/etl")
+EXAMPLE: ctx_kb_index(content: "# My docs
+...", source: "ai-skills")`,inputSchema:M.object({content:M.string().optional().describe("Raw text/markdown to index. Provide this OR path, not both."),path:M.string().optional().describe("File path to read and index (content never enters context). Provide this OR content."),source:M.string().describe("Label for the indexed content (e.g., 'lyft/etl', 'ai-skills')")})},async({content:t,path:e,source:r})=>{if(!t&&!e)return F("ctx_kb_index",{content:[{type:"text",text:"Error: Either content or path must be provided"}],isError:!0});let n=V_();if(!n)return F("ctx_kb_index",{content:[{type:"text",text:"Knowledge base not available. Check CONTEXT_MODE_KNOWLEDGE_DB env var."}],isError:!0});try{let o=n.index({content:t,path:e,source:r});return F("ctx_kb_index",{content:[{type:"text",text:`Indexed ${o.totalChunks} sections (${o.codeChunks} with code) from: ${o.label}
 Use ctx_kb_search(queries: ["..."]) to query. Use source: "${o.label}" to scope results.`}]})}catch(o){return F("ctx_kb_index",{content:[{type:"text",text:`KB index error: ${o instanceof Error?o.message:String(o)}`}],isError:!0})}});Br=0,O_=Date.now(),BB=G_("CONTEXT_MODE_SEARCH_WINDOW_MS",6e4),I_=G_("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER",3),Ql=G_("CONTEXT_MODE_SEARCH_BLOCK_AFTER",8);Ie.registerTool("ctx_search",{title:"Search Indexed Content",description:'Search a unified knowledge base with a multi-strategy ranking pipeline. Two parallel matchers run on every query: a Porter-stemming matcher ("caching" finds "cached", "caches", "cach") and a trigram-substring matcher ("useEff" finds "useEffect"). Their ranked lists are merged via Reciprocal Rank Fusion, so a document that ranks well in both surfaces above one that wins only on a single strategy. Multi-term queries get an additional proximity-rerank pass that boosts passages where the query terms appear close together. Typos are corrected via Levenshtein distance and re-searched. Result snippets are window-extracted around the matched terms, not blindly truncated.\n\nThe knowledge base is unified: queries reach indexed content you stored (ctx_index, ctx_fetch_and_index, ctx_batch_execute output) AND auto-captured session memory written by hooks (decisions, errors, blockers, plans, user prompts, rejected approaches, tool failures, compaction guides \u2014 26 event categories). File-backed sources carry a content hash and auto-flag staleness when the source file changes.\n\nWHEN:\n  - You want to recall something that exists in storage (recently indexed content, prior session events, auto-memory) instead of re-reading raw sources\n  - You have multiple related questions about the same body of knowledge \u2014 batch every question into one call (the ranking pipeline runs per-query but the round-trip cost is paid once)\n  - You want to scope the query to one labelled source (pass `source` \u2014 partial match is fine)\n  - You want a chronological view across current session + prior sessions + persistent auto-memory (pass `sort: "timeline"` \u2014 the default `relevance` mode only ranks within the current session)\n  - You want to filter ranked results by content shape (pass `contentType: "code"` to surface implementation snippets or `contentType: "prose"` to surface explanations)\n\nWHEN NOT:\n  - The data you want to query has never been stored in the knowledge base AND no session memory has accumulated around it \u2014 capture first (run a gather-and-index call), then come back here to query\n  - You have one ad-hoc question against data that is not in the knowledge base \u2014 answer it inline by running code in the sandbox tool; one round-trip instead of capture-then-query\n\nRETURNS:\n  Per-query ranked sections with window-extracted snippets. Use 2-4 specific technical terms per query. Common session-memory source labels: `decision` (user corrections / preferences), `error` and `error-resolution` (past failures + their fixes), `blocker`, `plan`, `user-prompt`, `rejected-approach`, `compaction` (post-compact session guide). See ctx_stats for live category counts. Each response carries a throttle counter (call #N/M in the rolling time window); results taper toward the soft cap and calls block after the hard cap. Tune via CONTEXT_MODE_SEARCH_WINDOW_MS, CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER, CONTEXT_MODE_SEARCH_BLOCK_AFTER.\n\nEXAMPLE: ctx_search(queries: ["root cause", "proposed fix", "test coverage"], source: "issue-#683")\nEXAMPLE: ctx_search(queries: ["what did we decide about caching"], source: "decision", sort: "timeline")\nEXAMPLE: ctx_search(queries: ["useEffect cleanup pattern"], source: "react-docs", contentType: "code", limit: 5)\nEXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blockers"], sort: "timeline")',inputSchema:fP(C_)},async t=>{try{let e=qr(),r=t.sort||"relevance";if(r!=="timeline"&&e.getStats().chunks===0)return F("ctx_search",{content:[{type:"text",text:`Knowledge base is empty \u2014 no content has been indexed yet.
 
 ctx_search is a follow-up tool that queries previously indexed content. To gather and index content first, use:
@@ -1069,12 +1078,19 @@ ${w}`),h+=w.length}}finally{try{f?.close()}catch{}}let x=m.join(`
 > Throttle: call #${Br}/${Ql} in this window. ${E} call(s) before soft cap. Prefer ctx_search(queries: [...]) array form for multi-query workloads \u2014 it counts as a single call.`,x.trim().length===0){let O=e.listSources(),S=O.length>0?`
 Indexed sources: ${O.map(w=>`"${w.label}" (${w.chunkCount} sections)`).join(", ")}`:"";return F("ctx_search",{content:[{type:"text",text:`No results found.${S}`}]})}return F("ctx_search",{content:[{type:"text",text:x}]})}catch(e){let r=e instanceof Error?e.message:String(e);return F("ctx_search",{content:[{type:"text",text:`Search error: ${r}`}],isError:!0})}});Ie.registerTool("ctx_kb_search",{title:"Search Knowledge Base",description:`Search the GLOBAL PERSISTENT knowledge base \u2014 codebases, docs, and skills indexed via ctx_kb_index or CLI.
 
-Use this (NOT ctx_search) when looking for:
-- Lyft repos (lyft/etl, lyft/ads, lyft/skills, etc.)
-- ai-skills, linux-env configs
-- Any content indexed with ctx_kb_index
+WHEN:
+- Looking for content indexed across sessions (repos, docs, skills)
+- Querying Lyft repos (lyft/etl, lyft/ads, lyft/skills, etc.)
+- Finding ai-skills, linux-env configs, or any ctx_kb_index content
 
-Use ctx_search for content indexed THIS session only.`,inputSchema:M.object({queries:M.array(M.string()).min(1).max(8).describe("Search queries (1-8). Use varied phrasing for broader coverage."),source:M.string().optional().describe("Optional: scope results to a specific source label (e.g., 'lyft/etl')")})},async({queries:t,source:e})=>{let r=V_();if(!r)return F("ctx_kb_search",{content:[{type:"text",text:"Knowledge base not configured. Run: context-mode kb-index --path <file> --source <label>"}]});if(r.getStats().chunks===0)return F("ctx_kb_search",{content:[{type:"text",text:`Knowledge base is empty.
+WHEN NOT:
+- Content indexed only this session \u2014 use ctx_search instead
+
+RETURNS:
+  Per-query ranked sections with window-extracted snippets. Use source: "<label>" to scope to one indexed source.
+
+EXAMPLE: ctx_kb_search(queries: ["auth flow", "token refresh"], source: "lyft/etl")
+EXAMPLE: ctx_kb_search(queries: ["useEffect cleanup"])`,inputSchema:M.object({queries:M.array(M.string()).min(1).max(8).describe("Search queries (1-8). Use varied phrasing for broader coverage."),source:M.string().optional().describe("Optional: scope results to a specific source label (e.g., 'lyft/etl')")})},async({queries:t,source:e})=>{let r=V_();if(!r)return F("ctx_kb_search",{content:[{type:"text",text:"Knowledge base not configured. Run: context-mode kb-index --path <file> --source <label>"}]});if(r.getStats().chunks===0)return F("ctx_kb_search",{content:[{type:"text",text:`Knowledge base is empty.
 Populate it with: context-mode kb-index --path <file> --source <label>`}]});let o=[];for(let u of t){let l=r.searchWithFallback(u,5,e??void 0);o.push(...l)}let s=new Set,i=o.filter(u=>{let l=`${u.source}::${u.title}`;return s.has(l)?!1:(s.add(l),!0)});if(i.length===0)return F("ctx_kb_search",{content:[{type:"text",text:`No results in knowledge base for: ${t.join(", ")}`}]});let a=i.map(u=>`--- [${u.source}] ---
 ### ${u.title}
 
