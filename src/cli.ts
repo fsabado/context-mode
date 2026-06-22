@@ -69,7 +69,6 @@ function browserOpenArgv(
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
 import { isInProcessPluginPlatform } from "./adapters/types.js";
-import { ContentStore } from "./store.js";
 import type { HookAdapter } from "./adapters/types.js";
 
 /* -------------------------------------------------------
