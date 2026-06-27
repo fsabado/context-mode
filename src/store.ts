@@ -916,14 +916,25 @@ export class ContentStore {
         continue;
       }
       try {
+        // Read file once via fd (TOCTOU-safe gate from #442 round-3),
+        // then pass content directly to index() — avoids a second read
+        // inside index() and lets us hash the same bytes we indexed.
+        const fd = openSync(file, "r");
+        let content: string;
+        try {
+          const st = fstatSync(fd);
+          if (!st.isFile()) { failed++; continue; }
+          content = readFileSync(fd, "utf-8");
+        } finally {
+          closeSync(fd);
+        }
         // Per-file source label so ctx_search(source: "<file>") still works.
         const fileSource = source ? `${source}:${file}` : file;
-        const r = this.index({ path: file, source: fileSource, attribution });
+        const r = this.index({ path: file, content, source: fileSource, attribution });
         filesIndexed++;
         totalChunks += r.totalChunks;
       } catch {
-        // Per-file failure (e.g. fd-bound fstat rejection of a non-regular
-        // file that races between walk and read) — count + continue.
+        // Per-file failure — count + continue.
         failed++;
       }
     }

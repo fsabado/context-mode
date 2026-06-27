@@ -148,12 +148,16 @@ check("kb-search missing --query → exit 1", () => {
   return { ok: r.status !== 0, detail: `exit ${r.status}: ${r.stderr}` };
 });
 
-// ── search (alias) ────────────────────────────────────────────────────────────
-check("search <query>  (alias for kb-search)", () =>
-  expectOk(
-    cli("search", "--query", "kb-index directory"),
-    /\[/)
-);
+// ── search (positional legacy command, uses session DB not KB) ───────────────
+check("search <query>  (legacy positional command)", () => {
+  const r = spawnSync("node", [bundle, "search", "kb-index", "directory"], {
+    env: { ...process.env },
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+  // exits 0 whether or not results are found
+  return { ok: r.status === 0, detail: r.stdout.trim() || r.stderr };
+});
 
 // ── stats ─────────────────────────────────────────────────────────────────────
 check("stats  (shows sources + chunks)", () =>

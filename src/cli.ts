@@ -2201,8 +2201,11 @@ function runKbCmd(cmd: string): void {
 
     const store = openStore();
 
+    const maxFiles = getCliFlag("--max-files") ? parseInt(getCliFlag("--max-files")!, 10) : undefined;
+    const maxDepth  = getCliFlag("--max-depth")  ? parseInt(getCliFlag("--max-depth")!,  10) : undefined;
+
     if (filePath && statSync(filePath).isDirectory()) {
-      const result = store.indexDirectory({ path: filePath, source });
+      const result = store.indexDirectory({ path: filePath, source, maxFiles, maxDepth });
       store.close();
       if (isJson) {
         console.log(

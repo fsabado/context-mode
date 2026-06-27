@@ -53,6 +53,11 @@ assert:
     npm run assert-bundle
     npm run assert-asymmetric-drift
 
+# Sync version from package.json to all plugin manifests
+[group('build')]
+version-sync:
+    node scripts/version-sync.mjs
+
 # ── Dev ───────────────────────────────────────────────────────────────────────
 
 # Start MCP server in dev mode (tsx watch, no bundle needed)
@@ -106,6 +111,21 @@ test-kb:
 [group('test')]
 test-file file:
     node_modules/.bin/vitest run --reporter=verbose "{{file}}"
+
+# Smoke-test all CLI subcommands against cli.bundle.mjs (14 checks)
+[group('test')]
+test-cli:
+    node scripts/test-cli.mjs
+
+# Smoke-test all 13 MCP tools via JSON-RPC against server.bundle.mjs (19 checks)
+[group('test')]
+test-mcp:
+    CONTEXT_MODE_KNOWLEDGE_DB=/tmp/ctx-test-mcp-$PPID.db node scripts/test-mcp.mjs
+
+# Run both CLI and MCP smoke tests
+[group('test')]
+test-all: test-cli test-mcp
+    @echo "All smoke tests passed."
 
 # ── KB (knowledge base) ───────────────────────────────────────────────────────
 
