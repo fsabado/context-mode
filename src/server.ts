@@ -2323,7 +2323,7 @@ EXAMPLE: ctx_kb_index(path: "/path/to/repo", source: "lyft/etl")
 EXAMPLE: ctx_kb_index(content: "# My docs\n...", source: "ai-skills")`,
     inputSchema: z.object({
       content: z.string().optional().describe("Raw text/markdown to index. Provide this OR path, not both."),
-      path: z.string().optional().describe("File path to read and index (content never enters context). Provide this OR content."),
+      path: z.string().optional().describe("File or directory path to read and index (content never enters context). Provide this OR content."),
       source: z.string().describe("Label for the indexed content (e.g., 'lyft/etl', 'ai-skills')"),
     }),
   },
@@ -2342,6 +2342,15 @@ EXAMPLE: ctx_kb_index(content: "# My docs\n...", source: "ai-skills")`,
       });
     }
     try {
+      if (path && statSync(path).isDirectory()) {
+        const result = kb.indexDirectory({ path, source });
+        return trackResponse("ctx_kb_index", {
+          content: [{
+            type: "text" as const,
+            text: `Indexed ${result.filesIndexed} files (${result.totalChunks} sections) from directory: ${result.label}\nUse ctx_kb_search(queries: ["..."]) to query. Use source: "${result.label}" to scope results.`,
+          }],
+        });
+      }
       const result = kb.index({ content, path, source });
       return trackResponse("ctx_kb_index", {
         content: [{
