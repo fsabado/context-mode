@@ -690,3 +690,27 @@ git add justfile scripts/test-cli.mjs
 PRE_COMMIT_ALLOW_NO_CONFIG=1 git commit -m "chore: wire --incremental into justfile ingest recipes and test-cli smoke"
 git push --force-with-lease origin main
 ```
+
+---
+
+## Addendum: code-chunk integration for Python/code files
+
+**Added:** 2026-06-27
+
+### Problem
+context-mode's `#chunkMarkdown` splits on `#` headings. Python files have none → one blob per file → poor search granularity.
+
+### Solution
+[`code-chunk`](https://github.com/supermemoryai/code-chunk) (npm, TypeScript, tree-sitter) splits `.py`/`.ts`/`.go`/`.rs`/`.js`/`.java` at AST boundaries (functions, classes, methods). Output per chunk includes scope chain + imports.
+
+### Integration approach
+Preprocessor script `scripts/ingest-code.mjs`:
+1. Walk files with `code-chunk`
+2. Convert each function/class chunk → markdown: `# ClassName > method_name\n\ncontent`
+3. Call `kb-index --content <markdown> --source lyft/etl:/abs/path/file.py`
+
+Per-file source labels preserved — no store changes needed. context-mode FTS5/BM25 handles storage and search as usual.
+
+### Files
+- `scripts/ingest-code.mjs` — new preprocessor script
+- `justfile` — add `ingest-etl-code` recipe using code-chunk path
