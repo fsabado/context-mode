@@ -2200,6 +2200,26 @@ function runKbCmd(cmd: string): void {
     }
 
     const store = openStore();
+
+    if (filePath && statSync(filePath).isDirectory()) {
+      const result = store.indexDirectory({ path: filePath, source });
+      store.close();
+      if (isJson) {
+        console.log(
+          JSON.stringify(
+            { source: result.label, totalChunks: result.totalChunks, filesIndexed: result.filesIndexed },
+            null,
+            2,
+          ),
+        );
+      } else {
+        console.log(
+          `Indexed ${result.totalChunks} chunks from ${result.filesIndexed} files in: ${result.label}`,
+        );
+      }
+      process.exit(0);
+    }
+
     const result = store.index({
       path: filePath ?? undefined,
       content: content ?? undefined,
