@@ -160,6 +160,99 @@ async function hookDispatch(platform: string, event: string): Promise<void> {
 }
 
 /* -------------------------------------------------------
+ * HTTP daemon helpers
+ * ------------------------------------------------------- */
+
+const CTX_DAEMON_PORT = Number(process.env.CONTEXT_MODE_DAEMON_PORT ?? 4748);
+
+function daemonPidFile(): string {
+  return join(tmpdir(), `context-mode-daemon-${CTX_DAEMON_PORT}.pid`);
+}
+
+function daemonUrl(path: string): string {
+  return `http://127.0.0.1:${CTX_DAEMON_PORT}${path}`;
+}
+
+/** Returns true if the daemon is reachable on its port. */
+async function isDaemonRunning(): Promise<boolean> {
+  return new Promise((resolve) => {
+    import("node:http").then(({ request }) => {
+      const req = request(daemonUrl("/health"), { timeout: 1000 }, (res) => {
+        resolve(res.statusCode === 200);
+        res.resume();
+      });
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.end();
+    }).catch(() => resolve(false));
+  });
+}
+
+/** Spawn server.bundle.mjs --http <port> detached; wait up to 3s for it to come up. */
+async function ensureDaemon(): Promise<void> {
+  if (await isDaemonRunning()) return;
+
+  // Find the server bundle — prefer the friendly-named install, fall back to sibling
+  const bundleDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(bundleDir, "ctx-server"),
+    join(bundleDir, "server.bundle.mjs"),
+  ];
+  const serverBundle = candidates.find(p => existsSync(p));
+  if (!serverBundle) {
+    throw new Error(`ctx-server (or server.bundle.mjs) not found in ${bundleDir} — run 'just install-cli'`);
+  }
+
+  const { spawn } = await import("node:child_process");
+  // Always use node (not process.execPath) to spawn the daemon.
+  // process.execPath may be Bun when ctx is called under Bun; Bun overrides
+  // os.tmpdir() inside the server process, breaking ctx_fetch_and_index.
+  const nodeRuntime = process.execPath.endsWith("bun") || process.execPath.endsWith("bun.exe")
+    ? "node"
+    : process.execPath;
+  const child = spawn(nodeRuntime, [serverBundle, "--http", String(CTX_DAEMON_PORT)], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+
+  // Poll until healthy (max 3s)
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 100));
+    if (await isDaemonRunning()) return;
+  }
+  throw new Error(`Context Mode daemon did not start in time on port ${CTX_DAEMON_PORT}`);
+}
+
+/** Call a tool on the running daemon. Throws on error. */
+async function callDaemon(toolName: string, toolArgs: unknown): Promise<unknown> {
+  const { request } = await import("node:http");
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ name: toolName, arguments: toolArgs });
+    const req = request(
+      daemonUrl("/tools/call"),
+      { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }, timeout: 30000 },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk: Buffer) => { data += chunk; });
+        res.on("end", () => {
+          try {
+            const parsed = JSON.parse(data) as { error?: string };
+            if (parsed.error) reject(new Error(parsed.error));
+            else resolve(parsed);
+          } catch { reject(new Error(`Bad response: ${data}`)); }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Daemon request timed out")); });
+    req.write(body);
+    req.end();
+  });
+}
+
+/* -------------------------------------------------------
  * Entry point
  * ------------------------------------------------------- */
 
@@ -201,9 +294,14 @@ function printHelp(): void {
 if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
   printHelp();
 } else if (args[0] === "index") {
-  indexCommand(args.slice(1)).then((code) => process.exit(code));
+  ensureDaemon().then(() => indexCommand(args.slice(1))).then((code) => process.exit(code)).catch((err) => {
+    // daemon failed — fall back to in-process
+    indexCommand(args.slice(1)).then((code) => process.exit(code));
+  });
 } else if (args[0] === "search") {
-  searchCommand(args.slice(1)).then((code) => process.exit(code));
+  ensureDaemon().then(() => searchCommand(args.slice(1))).then((code) => process.exit(code)).catch(() => {
+    searchCommand(args.slice(1)).then((code) => process.exit(code));
+  });
 } else if (args[0] === "doctor") {
   doctor().then((code) => process.exit(code));
 } else if (args[0] === "upgrade") {
@@ -224,6 +322,30 @@ if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
   });
 } else if (args[0] === "hook") {
   hookDispatch(args[1], args[2]);
+} else if (args[0] === "daemon") {
+  // daemon start | stop | status
+  const sub = args[1] ?? "status";
+  if (sub === "start") {
+    ensureDaemon().then(() => {
+      console.log(`Daemon running on port ${CTX_DAEMON_PORT}`);
+    }).catch((err: unknown) => {
+      console.error("Failed to start daemon:", err instanceof Error ? err.message : err);
+      process.exit(1);
+    });
+  } else if (sub === "stop") {
+    const pidFile = daemonPidFile();
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      process.kill(pid, "SIGTERM");
+      console.log(`Stopped daemon (pid ${pid})`);
+    } catch {
+      console.log("Daemon not running (no pid file or already stopped)");
+    }
+  } else {
+    isDaemonRunning().then((running) => {
+      console.log(running ? `Daemon running on port ${CTX_DAEMON_PORT}` : `Daemon not running (port ${CTX_DAEMON_PORT})`);
+    });
+  }
 } else if (args[0] === "insight") {
   insight(args[1] ? Number(args[1]) : 4747);
 } else if (args[0] === "statusline") {

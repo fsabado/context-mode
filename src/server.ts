@@ -8,6 +8,7 @@ import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
 import { request as httpsRequest } from "node:https";
+import { createServer as createHttpServer } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
@@ -5071,9 +5072,94 @@ async function main() {
   }
 }
 
-if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
-  main().catch((err) => {
-    console.error("Fatal:", err);
-    process.exit(1);
+// ─────────────────────────────────────────────────────────
+// HTTP daemon mode  (server.bundle.mjs --http [port])
+// ─────────────────────────────────────────────────────────
+
+export const CTX_DAEMON_PORT = Number(process.env.CONTEXT_MODE_DAEMON_PORT ?? 4748);
+
+/** PID file path shared by daemon and CLI. */
+function daemonPidFile(): string {
+  return join(tmpdir(), `context-mode-daemon-${CTX_DAEMON_PORT}.pid`);
+}
+
+async function startHttpDaemon(port: number): Promise<void> {
+  // Write pid file immediately so a concurrent CLI call can find us.
+  try { writeFileSync(daemonPidFile(), String(process.pid)); } catch { /* best effort */ }
+
+  const httpServer = createHttpServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, pid: process.pid, port }));
+      return;
+    }
+    if (req.method !== "POST" || req.url !== "/tools/call") {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", async () => {
+      try {
+        const { name, arguments: input } = JSON.parse(body) as { name: string; arguments: unknown };
+        type RegisteredTool = { handler: (input: unknown) => Promise<unknown>; enabled: boolean };
+        const tools = (server as unknown as { _registeredTools: Record<string, RegisteredTool> })._registeredTools;
+        const tool = tools[name];
+        if (!tool || !tool.enabled) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `Tool not found: ${name}` }));
+          return;
+        }
+        // Apply Zod schema parse so defaults and coercions match MCP SDK behaviour.
+        let parsedInput: unknown = input;
+        try {
+          if (tool.inputSchema && typeof (tool.inputSchema as { parse?: unknown }).parse === "function") {
+            parsedInput = (tool.inputSchema as { parse: (v: unknown) => unknown }).parse(input ?? {});
+          }
+        } catch (parseErr) {
+          const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `Invalid input: ${msg}` }));
+          return;
+        }
+        const result = await tool.handler(parsedInput);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: message }));
+      }
+    });
   });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.listen(port, "127.0.0.1", () => resolve());
+    httpServer.on("error", reject);
+  });
+
+  console.error(`Context Mode daemon v${VERSION} listening on http://127.0.0.1:${port}`);
+
+  const cleanup = () => { try { unlinkSync(daemonPidFile()); } catch { /* best effort */ } };
+  process.on("SIGINT", () => { cleanup(); httpServer.close(); process.exit(0); });
+  process.on("SIGTERM", () => { cleanup(); httpServer.close(); process.exit(0); });
+  process.on("exit", cleanup);
+}
+
+if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+  const httpFlagIdx = process.argv.indexOf("--http");
+  if (httpFlagIdx !== -1) {
+    const portArg = process.argv[httpFlagIdx + 1];
+    const port = (portArg && !portArg.startsWith("-")) ? Number(portArg) : CTX_DAEMON_PORT;
+    startHttpDaemon(port).catch((err) => {
+      console.error("Fatal:", err);
+      process.exit(1);
+    });
+  } else {
+    main().catch((err) => {
+      console.error("Fatal:", err);
+      process.exit(1);
+    });
+  }
 }

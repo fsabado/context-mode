@@ -39,6 +39,29 @@ bundle-cli:
     npx esbuild src/cli.ts --bundle --platform=node --target=node18 --format=esm \
         --outfile=cli.bundle.mjs --external:better-sqlite3 --minify
 
+# Build cli and install to ~/.local/bin/ctx
+[group('build')]
+install-cli: bundle-cli bundle-server
+    cp cli.bundle.mjs ~/.local/bin/ctx
+    chmod +x ~/.local/bin/ctx
+    ln -sf {{root}}/server.bundle.mjs ~/.local/bin/ctx-server
+    @echo "installed → ~/.local/bin/ctx (copy) + ctx-server (symlink)"
+
+# Start HTTP daemon on port 4748 (detached) for CLI use
+[group('dev')]
+daemon-start:
+    node server.bundle.mjs --http {{env_var_or_default("CONTEXT_MODE_DAEMON_PORT", "4748")}}
+
+# Check daemon status
+[group('dev')]
+daemon-status:
+    node cli.bundle.mjs daemon status
+
+# Stop daemon
+[group('dev')]
+daemon-stop:
+    node cli.bundle.mjs daemon stop
+
 # Bundle only the session/hook bundles
 [group('build')]
 bundle-hooks:
