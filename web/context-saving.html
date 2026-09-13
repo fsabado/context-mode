@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Context Saving — context-mode plugin saves 98% of your AI agent's context window</title>
-<meta name="description" content="Context Saving is the open-source context-mode plugin that keeps raw data out of the LLM context window. Sandbox tool output, index it into FTS5, search on demand. 287,000+ developers across 15 platforms.">
+<meta name="description" content="Context Saving is the open-source context-mode plugin that keeps raw data out of the LLM context window. Sandbox tool output, index it into FTS5, search on demand. 331,200+ developers across 17 adapters.">
 <link rel="canonical" href="https://context-mode.com/context-saving">
 <link rel="icon" type="image/svg+xml" href="/favicon-context-saving.svg">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-context-saving-32.png">
@@ -12,7 +12,7 @@
 
 <meta property="og:type" content="website">
 <meta property="og:title" content="Context Saving — the other half of the context problem">
-<meta property="og:description" content="Your AI coding agent burns through context in 20 minutes. The context-mode plugin keeps 98% of tool output out of the conversation. 287,000+ developers across 15 platforms.">
+<meta property="og:description" content="Your AI coding agent burns through context in 20 minutes. The context-mode plugin keeps 98% of tool output out of the conversation. 331,200+ developers across 17 adapters.">
 <meta property="og:url" content="https://context-mode.com/context-saving">
 <meta property="og:site_name" content="context-mode">
 <meta property="og:image" content="https://context-mode.com/og/context-saving.png">
@@ -46,6 +46,8 @@
   --blue:#a3bfff;
   --sans:'IBM Plex Sans',-apple-system,sans-serif;
   --mono:'IBM Plex Mono','SF Mono',monospace;
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  --ease-in-out:cubic-bezier(.77,0,.175,1);
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
@@ -242,6 +244,32 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
 .dropdown-item-desc .badge-mini.live{color:#10b981;background:rgba(16,185,129,.10);border:1px solid rgba(16,185,129,.22)}
 .dropdown-item-desc .badge-mini.coming{color:var(--text-4);background:rgba(255,255,255,.03);border:1px solid var(--border)}
 @media(max-width:760px){.topnav-menu{display:none}.topnav-cta .btn{padding:.45rem .65rem;font-size:12.5px}}
+
+/* ═══ Motion polish · Emil design-engineering pass ═══ */
+.btn{transition:transform .12s var(--ease-out),background-color .15s var(--ease-out),color .15s var(--ease-out),border-color .15s var(--ease-out)}
+.topnav-item{transition:color .15s var(--ease-out),background-color .15s var(--ease-out)}
+.badge{transition:color .15s var(--ease-out),background-color .15s var(--ease-out),border-color .15s var(--ease-out)}
+.btn:active{transform:scale(.97)}
+.card:active{transform:scale(.99)}
+.sticky-button{transition:transform .12s var(--ease-out),background-color .15s var(--ease-out)}
+.sticky-button:active{transform:scale(.97)}
+.btn:focus-visible,.topnav-item:focus-visible,.dropdown-item:focus-visible,.sticky-button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rev{transition:opacity .5s var(--ease-out),transform .5s var(--ease-out)}
+.dropdown-menu{transform-origin:top left;transform:translateY(-4px) scale(.98);transition:opacity .15s var(--ease-out),transform .15s var(--ease-out),visibility .15s}
+.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu{transform:translateY(0) scale(1)}
+.dropdown .caret{transition:transform .15s var(--ease-out)}
+.dropdown:hover .caret,.dropdown:focus-within .caret{transform:rotate(180deg)}
+@media (hover:none){
+  .card:hover,.bench-item:hover,.install:hover{transform:none}
+}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .rev{opacity:1 !important;transform:none !important;transition:none !important}
+  .btn:active,.card:active,.sticky-button:active{transform:none}
+  .sticky-cta{transition:none}
+  .dropdown-menu,.dropdown:hover .dropdown-menu{transform:translateY(0) scale(1)}
+  .dropdown:hover .caret,.dropdown:focus-within .caret{transform:none}
+}
 </style>
 </head>
 <body>
@@ -258,7 +286,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
           <div class="dropdown-label">Platform</div>
           <a href="/insight" class="dropdown-item">
             <div class="dropdown-item-title">Context Mode<span class="italic">Insight</span></div>
-            <div class="dropdown-item-desc">Org observability for AI-assisted engineering <span class="badge-mini live">live · $20/seat</span></div>
+            <div class="dropdown-item-desc">Engineering signal for AI-assisted teams <span class="badge-mini live">live · $20/seat</span></div>
           </a>
           <a href="#" class="dropdown-item future" onclick="return false">
             <div class="dropdown-item-title">Context Mode<span class="italic">Memory</span></div>
@@ -291,12 +319,12 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
     <h1 class="h1"><span class="prompt">$</span>context<span class="dash">-</span>mode<span class="cursor"></span></h1>
     <p class="hero-tag"><span class="dot"></span>open-source plugin · ELv2 · part of <a href="/">Context Mode</a></p>
     <p class="hero-sub">
-      <strong>The other half of the context problem.</strong> An MCP plugin that sandboxes tool output and indexes it into a local FTS5 store. Your AI coding agent searches that store instead of re-sending raw bytes every turn. <em>15 platforms. <span class="js-user-count">287,000+</span> developers. Runs entirely on your machine.</em>
+      <strong>The other half of the context problem.</strong> An MCP plugin that sandboxes tool output and indexes it into a local FTS5 store. Your AI coding agent searches that store instead of re-sending raw bytes every turn. <em>17 adapters. <span class="js-user-count">331,200+</span> developers. Runs entirely on your machine.</em>
     </p>
 
     <div class="hero-stats">
-      <div class="hero-stat"><div class="val" id="stat-users">287k+</div><div class="lbl">developers</div></div>
-      <div class="hero-stat"><div class="val">15</div><div class="lbl">platforms</div></div>
+      <div class="hero-stat"><div class="val" id="stat-users">331.2k+</div><div class="lbl">developers</div></div>
+      <div class="hero-stat"><div class="val">17</div><div class="lbl">adapters</div></div>
       <div class="hero-stat"><div class="val">#1</div><div class="lbl">on Hacker News</div></div>
       <div class="hero-stat"><div class="val" id="stat-stars">—</div><div class="lbl">GitHub stars</div></div>
       <div class="hero-stat"><div class="val">ELv2</div><div class="lbl">open source</div></div>
@@ -495,7 +523,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
     <a href="/insight" class="insight-teaser rev" style="display:block;color:inherit;text-decoration:none">
       <h3><span class="sans">Context Mode</span><span class="italic">Insight</span></h3>
       <p class="muted">
-        Org observability for AI-assisted engineering. Same plugin your team already runs — opt-in event forwarding into a private workspace. <strong style="color:var(--fg)">$20 / seat / month.</strong> Built on the structural events context-mode already captures locally.
+        Engineering signal for AI-assisted teams. Same plugin your team already runs — opt-in event forwarding into a private workspace. <strong style="color:var(--fg)">$20 / seat / month.</strong> Built on the structural events context-mode already captures locally.
       </p>
       <p style="margin-top:1rem;font-family:var(--mono);font-size:13px;color:var(--blue)">platform.context-mode.com →</p>
     </a>
@@ -508,14 +536,14 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
 <section class="chapter">
   <div class="wrap">
     <div class="rev" style="max-width:840px">
-      <p class="section-num">§ 07 · platforms</p>
-      <h2 class="h2">15 platforms, one plugin.</h2>
+      <p class="section-num">§ 07 · adapters</p>
+      <h2 class="h2">17 adapters, one plugin.</h2>
       <div class="rule"></div>
-      <p class="lead">Works on Claude Code, Cursor, Copilot, Codex, Gemini CLI, and ten more. Platforms with hook support get automatic routing. The rest use instruction-based rules. <em>Same plugin everywhere.</em></p>
+      <p class="lead">Works on Claude Code, Cursor, Copilot, Codex, Gemini CLI, and twelve more. Platforms with hook support get automatic routing. The rest use instruction-based rules. <em>Same plugin everywhere.</em></p>
     </div>
 
     <div class="platform-tags rev">
-      <span class="tag">Claude Code</span><span class="tag">Cursor</span><span class="tag">Codex CLI</span><span class="tag">VS Code Copilot</span><span class="tag">JetBrains Copilot</span><span class="tag">Gemini CLI</span><span class="tag">Qwen Code</span><span class="tag">Kiro</span><span class="tag">OpenCode</span><span class="tag">KiloCode</span><span class="tag">Zed</span><span class="tag">OpenClaw</span><span class="tag">Pi</span><span class="tag">Oh My Pi</span><span class="tag">Antigravity</span>
+      <span class="tag">Claude Code</span><span class="tag">Cursor</span><span class="tag">Codex CLI</span><span class="tag">VS Code Copilot</span><span class="tag">JetBrains Copilot</span><span class="tag">Gemini CLI</span><span class="tag">Qwen Code</span><span class="tag">Kiro</span><span class="tag">OpenCode</span><span class="tag">KiloCode</span><span class="tag">Zed</span><span class="tag">OpenClaw</span><span class="tag">Pi</span><span class="tag">Oh My Pi</span><span class="tag">Antigravity</span><span class="tag">GitHub Copilot CLI</span><span class="tag">Antigravity CLI</span>
     </div>
   </div>
 </section>

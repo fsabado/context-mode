@@ -267,7 +267,7 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
   // workspace-committed `.github/hooks/context-mode.json` etc.). The fix was
   // surgical at the adapter layer; nothing structural prevents a future
   // contributor from accidentally re-introducing the same bug class in any
-  // of the 15 adapters under configs/.
+  // of the 17 adapters under configs/.
   //
   // This invariant scans every committed config template under configs/**
   // and asserts that no string value contains an absolute path, an fnm

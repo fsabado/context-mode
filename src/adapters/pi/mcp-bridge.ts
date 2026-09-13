@@ -407,6 +407,12 @@ export class MCPStdioClient {
     private readonly serverScript: string,
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly runtimeOverride: string | null = null,
+    /**
+     * TUI-safe sink for the child's forwarded stderr (#868). Defaults to a
+     * no-op so direct callers (skippedBridge, tests) never leak to the
+     * terminal; bootstrapMCPTools wires this to the Pi host's file logger.
+     */
+    private readonly diag: BridgeDiag = () => {},
   ) {}
 
   /** Spawn the MCP child. Idempotent. */
@@ -492,23 +498,22 @@ export class MCPStdioClient {
     this.child = spawn(runtime, [this.serverScript], {
       // Pipe stderr (#472 round-3): swallowing it via "ignore" hides
       // server crash diagnostics — the user only saw "ctx_* tools will
-      // not be callable" with no clue WHY. Forwarding to process.stderr
-      // with a [mcp-bridge] prefix lets ops grep across session noise.
+      // not be callable" with no clue WHY. We capture it so the diagnostic
+      // is preserved, but route it through `diag` (Pi's file logger), NOT
+      // process.stderr — Pi's raw-mode TUI owns the terminal and any console
+      // write is rendered into the editor input box, blocking typing (#868).
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
     });
     this.child.stdout?.on("data", (chunk) => this.onData(chunk));
     this.child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf-8");
-      // Preserve original line breaks; prefix every non-empty line so
-      // multi-line traces stay grep-friendly.
-      const prefixed = text
-        .split(/\r?\n/)
-        .map((line, i, arr) =>
-          i === arr.length - 1 && line === "" ? "" : `[mcp-bridge] ${line}`,
-        )
-        .join("\n");
-      process.stderr.write(prefixed);
+      // Forward each non-empty line, [mcp-bridge]-prefixed so it stays
+      // grep-friendly in ~/.omp/logs. debug level: this is mostly routine
+      // child chatter (e.g. the #854 idle-reaper notice), not an alert.
+      for (const line of splitDiagLines(text)) {
+        if (line !== "") this.diag(`[mcp-bridge] ${line}`, "debug");
+      }
     });
     this.child.on("exit", () => this.onExit());
     this.child.on("error", () => this.onExit());
@@ -788,6 +793,100 @@ export interface PiToolRegistration {
 
 export interface PiLikeAPI {
   registerTool: (tool: PiToolRegistration) => void;
+  /**
+   * Pi's rotating file logger (`~/.omp/logs/`). Pi runs a raw-mode TUI that
+   * owns the terminal, so an in-process extension MUST NOT write to
+   * process.stdout/stderr — any console write is rendered straight into the
+   * editor input box and blocks typing (#868, confirmed against
+   * oh-my-pi tui/terminal.ts raw-mode + docs/skills/authoring-extensions.md:
+   * "nothing is written to the console, which would corrupt the TUI"). All
+   * bridge diagnostics route here instead. Optional: absent in tests / minimal
+   * hosts, in which case diagnostics are dropped — we NEVER fall back to the
+   * terminal.
+   */
+  logger?: {
+    debug?: (message: string, context?: Record<string, unknown>) => void;
+    info?: (message: string, context?: Record<string, unknown>) => void;
+    warn?: (message: string, context?: Record<string, unknown>) => void;
+    error?: (message: string, context?: Record<string, unknown>) => void;
+  };
+}
+
+/** TUI-safe diagnostics sink: routes to Pi's file logger, never the terminal. */
+export type BridgeDiag = (line: string, level?: "warn" | "debug") => void;
+
+/**
+ * Build a {@link BridgeDiag} bound to a Pi host's file logger (#868). Writing to
+ * process.stderr from inside Pi's raw-mode TUI corrupts the editor, so every
+ * bridge diagnostic — the forwarded MCP child stderr included — goes to
+ * `pi.logger` instead. When no logger is reachable (tests, non-Pi hosts) the
+ * line is dropped; we never touch the terminal as a fallback.
+ */
+export function makeBridgeDiag(pi: PiLikeAPI | null | undefined): BridgeDiag {
+  const logger = pi?.logger;
+  return (line, level = "warn") => {
+    try {
+      const fn = level === "debug" ? logger?.debug : logger?.warn;
+      if (typeof fn === "function") fn(line);
+    } catch {
+      /* never throw from diagnostics — and never write to the TUI terminal */
+    }
+  };
+}
+
+/**
+ * Split a chunk of forwarded child output into lines without a regex (the repo
+ * forbids regex in source). Trailing `\r` is stripped so CRLF traces stay clean
+ * in the log; the final partial line (no trailing newline) is preserved.
+ */
+export function splitDiagLines(text: string): string[] {
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "\n") {
+      let end = i;
+      if (end > start && text[end - 1] === "\r") end--;
+      lines.push(text.slice(start, end));
+      start = i + 1;
+    }
+  }
+  if (start < text.length) lines.push(text.slice(start));
+  return lines;
+}
+
+/**
+ * #868: is this the FOREGROUND interactive Pi session (vs a subagent / print /
+ * RPC session)? Pi passes an ExtensionContext as the 2nd arg to
+ * `before_agent_start`; `ctx.hasUI === true` only for the interactive session
+ * with a real UI attached (refs oh-my-pi runner.ts:330-331), while subagents
+ * are provably `hasUI: false` (refs executor.ts:2052). Fail-safe: treat anything
+ * that is NOT an explicit `hasUI === false` as foreground, so an
+ * ambiguous/absent ctx keeps the session's bridge ALIVE rather than risking the
+ * #868 idle-drop. Mis-classifying an abandoned non-interactive child as
+ * foreground only costs one lingering child until parent-death/ session_shutdown
+ * reaps it; the opposite error re-drops the user's tools mid-session.
+ */
+export function isForegroundSession(ctx: unknown): boolean {
+  const hasUI = (ctx as { hasUI?: unknown } | null | undefined)?.hasUI;
+  return hasUI !== false;
+}
+
+/**
+ * #868: derive the bridge child's spawn env for a session kind. The FOREGROUND
+ * interactive session's child must never be idle-reaped — a multi-minute human
+ * pause should not drop its ctx_* tools — so we disable the #854 reaper for it
+ * via `CONTEXT_MODE_BRIDGE_IDLE_MS=0` (lifecycle.ts honors 0 → reaper not armed).
+ * Sub-context / non-interactive children keep the default reaper so abandoned
+ * children still can't accumulate (#854). The foreground child is still reaped
+ * on actual parent death by the ppid/​signal watchdog (#311/#388) — only the
+ * idle-time path is disabled. Pure; does not mutate the input env.
+ */
+export function foregroundBridgeEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  foreground: boolean,
+): NodeJS.ProcessEnv {
+  if (!foreground) return baseEnv;
+  return { ...baseEnv, CONTEXT_MODE_BRIDGE_IDLE_MS: "0" };
 }
 
 /** Result of bootstrapping the bridge. */
@@ -815,6 +914,14 @@ export interface BootstrapOptions {
   env?: NodeJS.ProcessEnv;
   /** DI hook for tests: override the runtime resolver entirely. */
   _resolveJsRuntime?: () => string | null;
+  /**
+   * #868: true for the foreground interactive Pi session → spawn the child with
+   * the #854 idle reaper DISABLED so a human pause never drops its tools.
+   * Defaults to false (keep the reaper) for any non-foreground / unspecified
+   * caller; the pi extension resolves this from `ctx.hasUI` via
+   * {@link isForegroundSession}.
+   */
+  foreground?: boolean;
 }
 
 /**
@@ -837,6 +944,8 @@ export async function bootstrapMCPTools(
   options: BootstrapOptions = {},
 ): Promise<BridgeHandle> {
   const env = options.env ?? process.env;
+  // #868: all bridge diagnostics go to Pi's file logger, never the TUI terminal.
+  const diag = makeBridgeDiag(pi);
 
   // Recursion guard (#516): if an ancestor bridge already incremented
   // the depth counter, refuse to spawn another child — even if the
@@ -844,9 +953,9 @@ export async function bootstrapMCPTools(
   // re-exec Pi and other host swaps that bypass basename detection.
   const depth = Number.parseInt(env[BRIDGE_DEPTH_ENV] ?? "0", 10);
   if (Number.isFinite(depth) && depth > 0) {
-    process.stderr.write(
+    diag(
       `[context-mode] WARNING: skipping MCP bridge — ${BRIDGE_DEPTH_ENV}=${depth} ` +
-        `indicates recursion (fork-bomb guard, #516). ctx_* tools will not be callable.\n`,
+        `indicates recursion (fork-bomb guard, #516). ctx_* tools will not be callable.`,
     );
     return skippedBridge();
   }
@@ -856,14 +965,18 @@ export async function bootstrapMCPTools(
   // return an empty handle — the rest of the extension keeps working.
   const runtime = (options._resolveJsRuntime ?? resolveJsRuntimeForBridge)();
   if (runtime === null) {
-    process.stderr.write(
+    diag(
       `[context-mode] WARNING: no JS runtime found (need node or bun on PATH). ` +
-        `Skipping MCP bridge to avoid fork bomb (#516). ctx_* tools will not be callable.\n`,
+        `Skipping MCP bridge to avoid fork bomb (#516). ctx_* tools will not be callable.`,
     );
     return skippedBridge();
   }
 
-  const client = new MCPStdioClient(serverScript, env, runtime);
+  // #868: the foreground interactive session's child runs with the #854 idle
+  // reaper disabled (CONTEXT_MODE_BRIDGE_IDLE_MS=0) so a human pause never drops
+  // its tools; sub-context / non-interactive children keep the reaper (#854).
+  const spawnEnv = foregroundBridgeEnv(env, options.foreground ?? false);
+  const client = new MCPStdioClient(serverScript, spawnEnv, runtime, diag);
 
   // Retry-on-slow-initialize (#647).
   //
@@ -885,9 +998,9 @@ export async function bootstrapMCPTools(
       lastError = err;
       if (attempt === MAX_INIT_RETRIES) break;
       const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(
+      diag(
         `[context-mode] WARNING: MCP bridge initialize failed ` +
-          `(attempt ${attempt + 1}/${MAX_INIT_RETRIES + 1}): ${msg}. Retrying…\n`,
+          `(attempt ${attempt + 1}/${MAX_INIT_RETRIES + 1}): ${msg}. Retrying…`,
       );
       // Reclaim the failed child's fds before respawning. shutdown() is
       // idempotent and bounded by a 5s SIGKILL fallback (#472 round-3),

@@ -127,7 +127,7 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
     //     available, else `process.execPath` (#369 PATH resolution on Git
     //     Bash, #738 bun cold-start win).
     // Pre-D3 we hand-rolled `node "${pluginRoot}/hooks/X.mjs"` for all
-    // five events; bare `node` made claude-code the lone outlier and
+    // six events; bare `node` made claude-code the lone outlier and
     // dropping the execPath swap re-opened the Windows class. Algo-D3.5
     // (CI invariant in tests/adapters/claude-code.test.ts) locks this in
     // for adapter #16.
@@ -179,6 +179,17 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
             {
               type: "command",
               command: buildHookRuntimeCommand(`${pluginRoot}/hooks/sessionstart.mjs`),
+            },
+          ],
+        },
+      ],
+      Stop: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildHookRuntimeCommand(`${pluginRoot}/hooks/stop.mjs`),
             },
           ],
         },
@@ -490,10 +501,18 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
       }
     }
 
-    // If plugin hooks.json already covers all required hooks, skip settings.json
-    // registration entirely (Issue #198). Plugin installs don't need settings.json
-    // entries — hooks.json with ${CLAUDE_PLUGIN_ROOT} is the source of truth.
-    const pluginHooks = this.readPluginHooks(pluginRoot);
+    // If plugin hooks.json already covers all required hooks AND context-mode is
+    // actually installed as a Claude Code plugin (present in enabledPlugins), skip
+    // settings.json registration — hooks.json with ${CLAUDE_PLUGIN_ROOT} is the
+    // source of truth for plugin installs (Issue #198).
+    //
+    // Standalone / MacPorts installs are NOT in enabledPlugins. For those, the
+    // hooks/hooks.json shipped in the npm package is never consulted by Claude Code
+    // (it uses ${CLAUDE_PLUGIN_ROOT} which is only set in plugin mode). We must
+    // always write absolute-path hook commands to settings.json in that case.
+    const pluginRegistration = this.checkPluginRegistration();
+    const isPluginInstall = pluginRegistration.status === "pass";
+    const pluginHooks = isPluginInstall ? this.readPluginHooks(pluginRoot) : undefined;
     if (pluginHooks) {
       const allCovered = REQUIRED_HOOKS.every((ht) =>
         this.checkHookType(undefined, pluginHooks, ht),

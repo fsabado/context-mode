@@ -4,7 +4,7 @@
  * Both issues request that ctx_execute / ctx_execute_file / ctx_batch_execute
  * surface WHAT the agent ran so users can audit, debug, and block command
  * patterns. The server is the right layer — adapters render whatever the
- * response carries, so one fix covers all 15 adapters.
+ * response carries, so one fix covers all 17 adapters.
  *
  * Coverage by behaviour (vertical slices):
  *   1. runBatchCommands per-command section echoes `$ <command>` after `# <label>`

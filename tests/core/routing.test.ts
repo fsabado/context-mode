@@ -425,3 +425,96 @@ describe("Bash structurally-bounded allowlist: newline injection (#470)", () => 
     expect(isStructurallyBounded("git status\rfind /")).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// #817: size threshold so small Bash/WebFetch calls skip interception.
+//
+// PreToolUse cannot observe a command's ACTUAL output size (the command has
+// not run yet). The only deterministic pre-execution signal is the command
+// string itself. The Gemini CLI adapter solves the same problem with a matcher
+// that only fires on large-output tools — "avoids unnecessary hook overhead on
+// lightweight tools" (README L193). We mirror that at the routing layer with an
+// env-configurable command-length threshold: when CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES
+// is set to N>0, an unbounded Bash command whose string is shorter than N bytes
+// is treated as expected-lightweight and the routing nudge is skipped.
+//
+// Sane default: UNSET / 0 → current behavior (every unbounded command nudged),
+// so the context-saving guarantee for large outputs is NOT silently weakened.
+// Opt-in only — the operator chooses the threshold.
+// ─────────────────────────────────────────────────────────────────────────
+describe("Bash nudge size threshold (#817)", () => {
+  const SID = "threshold-817";
+  const ENV = "CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES";
+
+  beforeEach(() => {
+    resetGuidanceThrottle(SID);
+    delete process.env[ENV];
+  });
+
+  it("default (unset): short unbounded command STILL nudges — no behavior change", () => {
+    // Regression guard: without the env var, nothing changes. `ps` is short and
+    // unbounded — it must keep getting the nudge so the default stays safe.
+    const decision = routePreToolUse("Bash", { command: "ps" }, "/test", "claude-code", SID);
+    expect(decision?.action).toBe("context");
+  });
+
+  it("threshold set: short unbounded command below threshold SKIPS the nudge", () => {
+    process.env[ENV] = "64";
+    // "ps aux" is 6 bytes — below 64 → expected-lightweight → pass through.
+    const decision = routePreToolUse("Bash", { command: "ps aux" }, "/test", "claude-code", SID);
+    expect(decision, "short command below threshold should pass through untouched").toBeNull();
+  });
+
+  it("threshold set: long unbounded command at/above threshold STILL nudges", () => {
+    process.env[ENV] = "16";
+    // A long pipeline (> 16 bytes) can flood — must still intercept.
+    const long = "find / -type f -name '*.log' -exec cat {} +";
+    const decision = routePreToolUse("Bash", { command: long }, "/test", "claude-code", SID);
+    expect(decision?.action, "long command must still be nudged").toBe("context");
+  });
+
+  it("threshold does NOT relax curl/wget redirects (those stay deterministic)", () => {
+    process.env[ENV] = "4096"; // generous threshold — would otherwise mark this short cmd lightweight
+    // The threshold gates ONLY the generic Bash routing nudge. The curl/wget
+    // branch runs earlier and returns a `modify` redirect (or null only when
+    // MCP is unavailable) — it must NEVER be turned into a "pass-through-because-short".
+    // Assert the decision is NOT the generic "context" nudge: the threshold must
+    // not reclassify a curl flood as a lightweight bounded command.
+    const curl = routePreToolUse("Bash", { command: "curl https://x.io" }, "/test", "claude-code", SID);
+    expect(curl?.action ?? "modify-or-passthrough", "curl path must not become the generic nudge").not.toBe("context");
+  });
+
+  it("invalid / zero env value falls back to default (every unbounded cmd nudged)", () => {
+    for (const bad of ["0", "-5", "abc", ""]) {
+      resetGuidanceThrottle(SID);
+      process.env[ENV] = bad;
+      const decision = routePreToolUse("Bash", { command: "ps" }, "/test", "claude-code", SID);
+      expect(decision?.action, `env="${bad}" should behave as default`).toBe("context");
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Issue #856 — session_continuity framing must NOT present a captured snapshot
+// as an inescapable standing order. The old wording ("remain active until the
+// user revokes them" + "Do not drop behavioral directives as context grows")
+// turned a one-off casual phrase, once frozen as a role, into a directive the
+// model was told never to drop → do-nothing loop. The framing is softened so
+// continuity is a soft hint, not an irreversible mandate.
+// ════════════════════════════════════════════════════════════════════════════
+
+describe("Issue #856: session_continuity framing is a soft hint, not a standing order", () => {
+  const BLOCK = createRoutingBlock(_t, { includeCommands: false });
+
+  it("does not assert directives remain active 'until the user revokes them'", () => {
+    expect(BLOCK).not.toContain("remain active until the user revokes them");
+  });
+
+  it("does not command the model to never drop behavioral directives", () => {
+    expect(BLOCK).not.toContain("Do not drop behavioral directives as context grows");
+  });
+
+  it("still mentions session continuity (the hint is softened, not removed)", () => {
+    expect(BLOCK).toContain("session_continuity");
+  });
+});

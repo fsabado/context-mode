@@ -477,6 +477,56 @@ describe("OpenClawPlugin", () => {
     });
   });
 
+  // ── model.usage diagnostic subscription (cost capture wire) ──
+
+  describe("model.usage diagnostic subscription", () => {
+    it("subscribes via api.onDiagnosticEvent and flows a model.usage event to db.insertEvent", async () => {
+      // Capture the listener the plugin registers on the diagnostic bus.
+      let diagListener: ((evt: unknown) => void) | undefined;
+      const mock = createMockApiFull();
+      const api = {
+        ...mock.api,
+        onDiagnosticEvent(listener: (evt: unknown) => void) {
+          diagListener = listener;
+          return () => {};
+        },
+      };
+
+      const insertSpy = vi.spyOn(OpenClawSessionDB.prototype, "insertEvent");
+      insertSpy.mockClear();
+
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
+      await plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+      expect(typeof diagListener).toBe("function");
+
+      // Fire a real model.usage diagnostic payload.
+      diagListener!({
+        type: "model.usage",
+        model: "claude-sonnet-4",
+        usage: { input: 1200, output: 340, cacheRead: 5000, cacheWrite: 800 },
+        costUsd: 0.0421,
+      });
+
+      const usageInsert = insertSpy.mock.calls.find(
+        (c) => (c[1] as { type?: string })?.type === "agent_usage",
+      );
+      expect(usageInsert).toBeDefined();
+      expect((usageInsert![1] as { cost_usd?: number }).cost_usd).toBe(0.0421);
+      expect(usageInsert![2]).toBe("Diagnostic"); // PostToolUse-style source tag
+
+      // Non-usage payloads insert no agent_usage event (best-effort, no throw).
+      const before = insertSpy.mock.calls.length;
+      expect(() => diagListener!({ type: "model.failover" })).not.toThrow();
+      const afterUsage = insertSpy.mock.calls
+        .slice(before)
+        .filter((c) => (c[1] as { type?: string })?.type === "agent_usage");
+      expect(afterUsage).toHaveLength(0);
+
+      insertSpy.mockRestore();
+    });
+  });
+
   // ── command:new ───────────────────────────────────────
 
   describe("command:new", () => {

@@ -143,7 +143,22 @@ export function attributeAndInsertEvents(db, sessionId, events, input, projectDi
         ? { ...withBash, latency_ms: latencyMs, duration_bucket: bucketizeDuration(latencyMs) }
         : withBash;
       const payload = rollup ? { ...withLatency, ...rollup } : withLatency;
-      maybeForward({ ...payload, session_id: sessionId }, platform);
+      // Forward bytes_avoided (the context-saving savings signal) so the
+      // platform FinOps P&L can derive savings_usd = bytes/4 × price. Sourced
+      // from the canonical per-event bytesList (with an event-field fallback);
+      // only stamped when positive so the wire payload stays minimal.
+      const avoidedBytes = (bytesList && bytesList[i] && bytesList[i].bytesAvoided > 0)
+        ? bytesList[i].bytesAvoided
+        : (typeof events[i]?.bytes_avoided === "number" && events[i].bytes_avoided > 0 ? events[i].bytes_avoided : 0);
+      const withSavings = avoidedBytes > 0 ? { ...payload, bytes_avoided: avoidedBytes } : payload;
+      // Forward bytes_retrieved (the OTHER half of the with/without ratio): the
+      // tool_response size a ctx_search / ctx_fetch_and_index call paid to access
+      // kept-out content. Mirrors the bytes_avoided stamp — positive-only guard.
+      const retrievedBytes = typeof events[i]?.bytes_retrieved === "number" && events[i].bytes_retrieved > 0
+        ? events[i].bytes_retrieved
+        : 0;
+      const withRetrieval = retrievedBytes > 0 ? { ...withSavings, bytes_retrieved: retrievedBytes } : withSavings;
+      maybeForward({ ...withRetrieval, session_id: sessionId }, platform);
     }
   }
 

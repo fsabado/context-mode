@@ -114,21 +114,26 @@ describe("MCP bridge spawn — passes CONTEXT_MODE_BRIDGE_DEPTH=1 to child env (
 
 // Slice 3 — recursion guard via env counter
 describe("bootstrapMCPTools — recursion guard (#516)", () => {
-  it("aborts and logs once when CONTEXT_MODE_BRIDGE_DEPTH > 0 already set", async () => {
+  it("aborts and logs to pi.logger (NOT the TUI terminal) when CONTEXT_MODE_BRIDGE_DEPTH > 0 already set (#868)", async () => {
     process.env.CONTEXT_MODE_BRIDGE_DEPTH = "1";
 
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
     const { bootstrapMCPTools } = await import("../../src/adapters/pi/mcp-bridge.js");
-    const fakePi = { registerTool: vi.fn() };
+    const warn = vi.fn();
+    const fakePi = { registerTool: vi.fn(), logger: { warn, debug: vi.fn() } };
 
     const handle = await bootstrapMCPTools(fakePi, "/non/existent/server.mjs");
 
     expect(handle.tools).toEqual([]);
     expect(fakePi.registerTool).not.toHaveBeenCalled();
-    // Diagnostic must mention recursion / depth so ops can grep it.
-    const messages = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
-    expect(messages).toMatch(/recursion|depth|fork/i);
+    // #868: the diagnostic must go to Pi's file logger, never process.stderr
+    // (Pi's raw-mode TUI renders any console write into the editor).
+    expect(stderrSpy).not.toHaveBeenCalled();
+    const logged = warn.mock.calls.map((c) => String(c[0])).join("");
+    expect(
+      logged.includes("recursion") || logged.includes("depth") || logged.includes("fork"),
+    ).toBe(true);
 
     stderrSpy.mockRestore();
   });
@@ -136,11 +141,12 @@ describe("bootstrapMCPTools — recursion guard (#516)", () => {
 
 // Slice 4 — graceful skip when no JS runtime
 describe("bootstrapMCPTools — no JS runtime + execPath is pi (#516)", () => {
-  it("logs once to stderr and returns an empty handle without throwing", async () => {
+  it("logs to pi.logger (NOT the TUI terminal) and returns an empty handle without throwing (#868)", async () => {
     const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
     const { bootstrapMCPTools } = await import("../../src/adapters/pi/mcp-bridge.js");
-    const fakePi = { registerTool: vi.fn() };
+    const warn = vi.fn();
+    const fakePi = { registerTool: vi.fn(), logger: { warn, debug: vi.fn() } };
 
     // Inject the no-runtime condition through the same DI hook the
     // bridge uses internally — see resolveJsRuntimeForBridge above.
@@ -150,9 +156,41 @@ describe("bootstrapMCPTools — no JS runtime + execPath is pi (#516)", () => {
 
     expect(handle.tools).toEqual([]);
     expect(fakePi.registerTool).not.toHaveBeenCalled();
+    expect(stderrSpy).not.toHaveBeenCalled();
+    const logged = warn.mock.calls.map((c) => String(c[0])).join("");
+    expect(logged.includes("no JS runtime") || logged.includes("runtime")).toBe(true);
 
-    const messages = stderrSpy.mock.calls.map((c) => String(c[0])).join("");
-    expect(messages).toMatch(/no JS runtime|node.*bun|runtime.*not found/i);
+    stderrSpy.mockRestore();
+  });
+
+  it("makeBridgeDiag routes to pi.logger and NEVER process.stderr; splitDiagLines is regex-free (#868)", async () => {
+    const { makeBridgeDiag, splitDiagLines } = await import(
+      "../../src/adapters/pi/mcp-bridge.js"
+    );
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    const warn = vi.fn();
+    const debug = vi.fn();
+    const diag = makeBridgeDiag({ registerTool: vi.fn(), logger: { warn, debug } });
+    // the exact line that corrupted the editor in #868:
+    diag(
+      "[mcp-bridge] [context-mode] idle MCP bridge child self-shutdown after 180000ms with no activity (#854)",
+      "debug",
+    );
+    diag("[context-mode] WARNING: actionable", "warn");
+    expect(debug).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(stderrSpy).not.toHaveBeenCalled();
+
+    // No logger reachable -> drop silently, never throw, never touch stderr.
+    const diagNoLogger = makeBridgeDiag({ registerTool: vi.fn() });
+    expect(() => diagNoLogger("anything", "warn")).not.toThrow();
+    expect(stderrSpy).not.toHaveBeenCalled();
+
+    // splitDiagLines: \n split, trailing \r stripped, final partial preserved.
+    expect(splitDiagLines("a\nb\r\nc")).toEqual(["a", "b", "c"]);
+    expect(splitDiagLines("solo")).toEqual(["solo"]);
+    expect(splitDiagLines("trailing\n")).toEqual(["trailing"]);
 
     stderrSpy.mockRestore();
   });
@@ -1047,5 +1085,48 @@ describe("truncateAnsiLine / PiTextComponent — CJK width-aware truncation (#66
     // Must actually truncate (total width 6 > 4)
     const totalW = lines.reduce((sum, l) => sum + visibleWidth(l), 0);
     expect(totalW).toBeLessThanOrEqual(4);
+  });
+});
+
+// ── #868: keep the FOREGROUND interactive session's bridge alive ──
+// The #854 idle reaper must NOT reap the foreground child (a 3-min pause
+// shouldn't drop the user's ctx_* tools), while sub-context / non-interactive
+// children keep the reaper so abandoned ones still can't accumulate (#854).
+describe("foreground keep-alive — idle reaper scoped by session kind (#868)", () => {
+  it("isForegroundSession reads ctx.hasUI with a fail-safe default of foreground", async () => {
+    const { isForegroundSession } = await import("../../src/adapters/pi/mcp-bridge.js");
+    expect(isForegroundSession({ hasUI: true })).toBe(true);   // interactive foreground
+    expect(isForegroundSession({ hasUI: false })).toBe(false); // subagent / print / rpc
+    expect(isForegroundSession({})).toBe(true);                // ambiguous -> keep alive
+    expect(isForegroundSession(undefined)).toBe(true);         // no ctx -> keep alive
+    expect(isForegroundSession(null)).toBe(true);
+  });
+
+  it("foregroundBridgeEnv disables the reaper (IDLE_MS=0) for foreground, leaves sub-contexts on", async () => {
+    const { foregroundBridgeEnv } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const base = { CONTEXT_MODE_BRIDGE_DEPTH: "1", PATH: "/x" };
+    const fg = foregroundBridgeEnv(base, true);
+    expect(fg.CONTEXT_MODE_BRIDGE_IDLE_MS).toBe("0"); // #868: never idle-reaped
+    expect(fg.PATH).toBe("/x");                        // base preserved
+    expect(base.CONTEXT_MODE_BRIDGE_IDLE_MS).toBeUndefined(); // no mutation of input
+    const sub = foregroundBridgeEnv(base, false);
+    expect(sub.CONTEXT_MODE_BRIDGE_IDLE_MS).toBeUndefined(); // #854: sub keeps the reaper
+  });
+
+  it("a foreground bridge child inherits CONTEXT_MODE_BRIDGE_IDLE_MS=0 in its spawn env", async () => {
+    const { MCPStdioClient, foregroundBridgeEnv } = await import(
+      "../../src/adapters/pi/mcp-bridge.js"
+    );
+    const serverPath = join(scratch, "fake-idle-server.mjs");
+    writeFileSync(serverPath, "process.stdin.resume();\n"); // inert child; we only inspect env
+    const env = foregroundBridgeEnv(
+      { ...process.env, CONTEXT_MODE_BRIDGE_DEPTH: "1" },
+      true,
+    );
+    const client = new MCPStdioClient(serverPath, env, process.execPath);
+    client.start();
+    const live = (client as unknown as { _spawnEnv?: NodeJS.ProcessEnv })._spawnEnv;
+    expect(live?.CONTEXT_MODE_BRIDGE_IDLE_MS).toBe("0");
+    client.shutdown();
   });
 });

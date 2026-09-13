@@ -82,6 +82,7 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     precompact: "hooks/precompact.mjs",
     sessionstart: "hooks/sessionstart.mjs",
     userpromptsubmit: "hooks/userpromptsubmit.mjs",
+    stop: "hooks/stop.mjs",
   },
   "gemini-cli": {
     beforeagent: "hooks/gemini-cli/beforeagent.mjs",
@@ -121,6 +122,22 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     precompact: "hooks/jetbrains-copilot/precompact.mjs",
     sessionstart: "hooks/jetbrains-copilot/sessionstart.mjs",
   },
+  "copilot-cli": {
+    pretooluse: "hooks/copilot-cli/pretooluse.mjs",
+    posttooluse: "hooks/copilot-cli/posttooluse.mjs",
+    precompact: "hooks/copilot-cli/precompact.mjs",
+    sessionstart: "hooks/copilot-cli/sessionstart.mjs",
+    userpromptsubmit: "hooks/copilot-cli/userpromptsubmit.mjs",
+    stop: "hooks/copilot-cli/stop.mjs",
+  },
+  // Antigravity CLI (`agy`) — bounded PreToolUse enforcement plus capture-only
+  // PostToolUse/Stop hooks. Configured via an installed agy plugin's
+  // hooks/hooks.json or ~/.gemini/config/hooks.json.
+  "antigravity-cli": {
+    pretooluse: "hooks/antigravity-cli/pretooluse.mjs",
+    posttooluse: "hooks/antigravity-cli/posttooluse.mjs",
+    stop: "hooks/antigravity-cli/stop.mjs",
+  },
   "kimi": {
     pretooluse: "hooks/kimi/pretooluse.mjs",
     posttooluse: "hooks/kimi/posttooluse.mjs",
@@ -153,7 +170,16 @@ async function hookDispatch(platform: string, event: string): Promise<void> {
 
   const scriptPath = HOOK_MAP[platform]?.[event];
   if (!scriptPath) {
-    process.exit(1);
+    // Fail OPEN. context-mode has no hook for this platform/event — most often
+    // because a newer adapter's hook command (`context-mode hook copilot-cli …`)
+    // is running against an OLDER global binary that predates that adapter
+    // (version skew). Exit 0 (no decision) so the host ALLOWS the tool. Exiting
+    // non-zero here makes some hosts treat it as a hook ERROR and DENY the tool:
+    // verified against GitHub Copilot CLI 1.0.59, where an exit-1 + empty-stdout
+    // PreToolUse hook blocks EVERY tool ("Denied by preToolUse hook (hook
+    // errored)") — bricking the agent during a skew instead of just disabling
+    // context-mode's instrumentation.
+    process.exit(0);
   }
   const pluginRoot = getPluginRoot();
   await import(pathToFileURL(join(pluginRoot, scriptPath)).href);
@@ -347,7 +373,7 @@ if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
     });
   }
 } else if (args[0] === "insight") {
-  insight(args[1] ? Number(args[1]) : 4747);
+  insight();
 } else if (args[0] === "statusline") {
   // Status line implementation lives in bin/statusline.mjs to keep it
   // dependency-free and fast. Forward stdin and exit with its result.
@@ -1313,109 +1339,17 @@ async function doctor(): Promise<number> {
 }
 
 /* -------------------------------------------------------
- * Insight — analytics dashboard
+ * Insight — hosted analytics dashboard
  * ------------------------------------------------------- */
 
-async function insight(port: number) {
-  try {
-  const { execSync, spawn } = await import("node:child_process");
-  const { statSync, mkdirSync, cpSync } = await import("node:fs");
-
-  const insightSource = resolve(getPluginRoot(), "insight");
-  // Detect platform + adapter for correct session/content paths
-  const detection = detectPlatform();
-  const adapter = await getAdapter(detection.platform);
-  const sessDir = ensureWritableStorageDir(resolveSessionStorageDir(() => adapter.getSessionDir()));
-  const contentDir = ensureWritableStorageDir(resolveContentStorageDir(() => sessDir));
-  const cacheDir = join(dirname(sessDir), "insight-cache");
-
-  if (!existsSync(join(insightSource, "server.mjs"))) {
-    console.error("Error: Insight source not found. Try upgrading context-mode.");
-    process.exit(1);
-  }
-
-  mkdirSync(cacheDir, { recursive: true });
-
-  // Copy source if newer
-  const srcMtime = statSync(join(insightSource, "server.mjs")).mtimeMs;
-  const cacheMtime = existsSync(join(cacheDir, "server.mjs"))
-    ? statSync(join(cacheDir, "server.mjs")).mtimeMs : 0;
-  if (srcMtime > cacheMtime) {
-    console.log("Copying Insight source...");
-    cpSync(insightSource, cacheDir, { recursive: true, force: true });
-  }
-
-  // Install deps
-  if (!existsSync(join(cacheDir, "node_modules"))) {
-    console.log("Installing dependencies (first run)...");
-    try {
-      npmExec("npm install --production=false", { cwd: cacheDir, stdio: "inherit", timeout: 300000 });
-    } catch {
-      // Clean up partial install so next run retries fresh
-      try { rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true }); } catch {}
-      throw new Error("npm install failed — please retry");
-    }
-    // Sentinel check: verify install completed (cold cache can timeout leaving partial node_modules)
-    if (!existsSync(join(cacheDir, "node_modules", "vite")) || !existsSync(join(cacheDir, "node_modules", "better-sqlite3"))) {
-      rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true });
-      throw new Error("npm install incomplete — please retry");
-    }
-  }
-
-  // Build
-  console.log("Building dashboard...");
-  execSync("npx vite build", { cwd: cacheDir, stdio: "pipe", timeout: 60000 });
-
-  // Start server
-  const url = `http://localhost:${port}`;
+// Insight pivoted from a locally-built dashboard to the hosted product at
+// context-mode.com/insight (the landing page is the single source of truth).
+// The command now just opens that URL in the default browser.
+async function insight() {
+  const url = "https://context-mode.com/insight";
   console.log(`\n  context-mode Insight\n  ${url}\n`);
-
-  const child = spawn("node", [join(cacheDir, "server.mjs")], {
-    cwd: cacheDir,
-    env: {
-      ...process.env,
-      PORT: String(port),
-      INSIGHT_SESSION_DIR: sessDir,
-      INSIGHT_CONTENT_DIR: contentDir,
-    },
-    stdio: "inherit",
-  });
-  child.on("error", () => {}); // prevent unhandled error crash
-
-  // Wait for server to be ready, then verify it started
-  await new Promise(r => setTimeout(r, 1500));
-
-  try {
-    const { request } = await import("node:http");
-    await new Promise<void>((resolve, reject) => {
-      const req = request(`http://127.0.0.1:${port}/api/overview`, { timeout: 3000 }, (res) => {
-        resolve();
-        res.resume();
-      });
-      req.on("error", reject);
-      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-      req.end();
-    });
-  } catch {
-    console.error(`\nError: Port ${port} appears to be in use. Either a previous dashboard is still running, or another service is using this port.`);
-    console.error(`\nTo fix:`);
-    console.error(`  Kill the existing process: ${process.platform === "win32" ? `netstat -ano | findstr :${port}` : `lsof -ti:${port} | xargs kill`}`);
-    console.error(`  Or use a different port:   context-mode insight ${port + 1}`);
-    child.kill();
-    process.exit(1);
-  }
-
   // Open browser — execFile with arg array, no shell interpolation.
   openInBrowser(url);
-
-  // Keep alive until Ctrl+C
-  process.on("SIGINT", () => { child.kill(); process.exit(0); });
-  process.on("SIGTERM", () => { child.kill(); process.exit(0); });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`\nInsight error: ${msg}`);
-    process.exit(1);
-  }
 }
 
 /* -------------------------------------------------------

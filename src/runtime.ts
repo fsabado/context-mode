@@ -32,6 +32,11 @@ function isWindowsWslBash(shellPath: string): boolean {
     /\\microsoft\\windowsapps\\bash\.exe$/.test(lower);
 }
 
+function isWindowsSystemCmd(shellPath: string): boolean {
+  const lower = shellPath.toLowerCase().replace(/\//g, "\\");
+  return /\\windows\\(?:system32|sysnative)\\cmd\.exe$/.test(lower);
+}
+
 export type Language =
   | "javascript"
   | "typescript"
@@ -166,36 +171,69 @@ function bunFallbackPaths(): string[] {
   return home ? [`${home}/.bun/bin/bun`] : [];
 }
 
+/** Well-known Git-for-Windows bash.exe locations (MSYS bash that performs
+ *  Windows→POSIX path conversion for native git — #826). */
+const KNOWN_GIT_BASH_PATHS = [
+  "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+  "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
+];
+
 /**
- * On Windows, resolve the first non-WSL bash in PATH.
- * WSL bash (C:\Windows\System32\bash.exe) cannot handle Windows paths,
- * so we skip it and prefer Git Bash or MSYS2 bash instead.
+ * On Windows, resolve the first non-WSL bash that is actually available.
+ *
+ * Availability is gated by `where bash` (#796): bash must be discoverable on
+ * PATH for us to claim it. WSL bash (C:\Windows\System32\bash.exe) cannot
+ * handle Windows paths, so we skip it and prefer Git Bash / MSYS2 bash.
+ *
+ * Routing the gate through `where bash` — rather than probing the known Git
+ * Bash paths with existsSync first — is deliberate: when bash is genuinely
+ * unavailable, the caller must fall through to pwsh (PR intent). Probing the
+ * filesystem first re-detected a real Git Bash on the runner even though the
+ * scenario was "bash unavailable", so pwsh was never reached.
+ *
+ * #826 is preserved: when `where bash` surfaces a Git Bash candidate we
+ * canonicalize it to the absolute Git\usr\bin\bash.exe path (so native git
+ * keeps MSYS path conversion) by preferring a matching known path that exists.
  */
 function resolveWindowsBash(): string | null {
-  // First, try well-known Git Bash locations directly (works even when
-  // Git\usr\bin is not on PATH, which is common in MCP server environments
-  // that only inherit Git\cmd from the system PATH).
-  const knownPaths = [
-    "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-    "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
-  ];
-  for (const p of knownPaths) {
-    if (existsSync(p)) return p;
-  }
-
-  // Fallback: scan PATH via `where bash`, skipping WSL and WindowsApps entries.
+  let candidates: string[];
   try {
     const result = execSync("where bash", { encoding: "utf-8", stdio: "pipe" });
-    const candidates = result.trim().split(/\r?\n/).map(p => p.trim()).filter(Boolean);
-    for (const p of candidates) {
-      const lower = p.toLowerCase();
-      if (lower.includes("system32") || lower.includes("windowsapps")) continue;
-      return p;
-    }
-    return null;
+    candidates = result.trim().split(/\r?\n/).map(p => p.trim()).filter(Boolean);
   } catch {
+    // bash not on PATH → genuinely unavailable. Fall through to pwsh/etc.
     return null;
   }
+
+  for (const p of candidates) {
+    const lower = p.toLowerCase();
+    if (lower.includes("system32") || lower.includes("windowsapps")) continue;
+    // Prefer the canonical Git\usr\bin\bash.exe so native git retains MSYS
+    // path conversion. `where bash` on a Git-for-Windows install may surface
+    // the Git\cmd\bash shim or usr\bin path; upgrade to a known absolute path
+    // when one exists on disk.
+    for (const known of KNOWN_GIT_BASH_PATHS) {
+      if (existsSync(known)) return known;
+    }
+    return p;
+  }
+  return null;
+}
+
+function resolveWindowsShell(windowsBash: string | null = resolveWindowsBash()): string {
+  // Prefer Git Bash (#826) so native git keeps its MSYS path conversion.
+  // The caller passes the already-resolved windowsBash to avoid probing the
+  // filesystem twice (it also feeds the cmd.exe shellOverride guard above).
+  // Fall back through POSIX sh, then PowerShell Core (pwsh) for proper UTF-8
+  // handling, then Windows PowerShell, then cmd.exe as the last resort.
+  return windowsBash
+    ?? (commandExists("sh")
+      ? "sh"
+      : commandExists("pwsh")
+        ? "pwsh"
+        : commandExists("powershell")
+          ? "powershell"
+          : "cmd.exe");
 }
 
 function getVersion(cmd: string, args: string[] = ["--version"]): string {
@@ -273,7 +311,17 @@ export function resolveJavascriptRuntime(
   if (JS_RUNTIMES.has(base)) {
     // Real JS runtime (node, bun, deno) — preserves #190 snap-Node fix
     // because the snap wrapper's binary is literally named `node`.
-    return execPath;
+    //
+    // Issue #800 — liveness guard: on Homebrew, process.execPath points into
+    // the versioned Cellar (/opt/homebrew/Cellar/node/26.0.0/bin/node).
+    // `brew upgrade` + `brew cleanup` deletes the old Cellar, so the path
+    // dangles for the life of the already-running MCP server.  If the path
+    // doesn't exist on disk, skip it and fall through to PATH node.
+    if (existsSync(execPath)) {
+      return execPath;
+    }
+    // Stale execPath (deleted Cellar, corrupted install, uninstall while
+    // process alive).  Fall through to PATH resolution below.
   }
 
   // Host binary (opencode/kilo/etc.) — fall back to node on PATH.
@@ -297,10 +345,15 @@ export function detectRuntimes(): RuntimeMap {
   // could redirect the executor to /usr/bin/python or any arbitrary binary.
   const userShell = process.env.SHELL;
   const isWin = process.platform === "win32";
+  const windowsBash = isWin ? resolveWindowsBash() : null;
   const shellOverride = userShell &&
     existsSync(userShell) &&
     isAllowlistedShell(userShell) &&
-    !(isWin && isWindowsWslBash(userShell))
+    !(isWin && isWindowsWslBash(userShell)) &&
+    // Windows OpenSSH can inject the system cmd.exe as ambient SHELL. When
+    // Git Bash is installed, treating that as an explicit override breaks the
+    // POSIX shell executor path restored by #36/#384/#791.
+    !(isWin && windowsBash && isWindowsSystemCmd(userShell))
     ? userShell
     : null;
 
@@ -321,7 +374,7 @@ export function detectRuntimes(): RuntimeMap {
           ? "py"
           : null,
     shell: shellOverride ?? (isWin
-      ? (resolveWindowsBash() ?? (commandExists("sh") ? "sh" : commandExists("powershell") ? "powershell" : "cmd.exe"))
+      ? resolveWindowsShell(windowsBash)
       : commandExists("bash") ? "bash" : "sh"),
     ruby: commandExists("ruby") ? "ruby" : null,
     go: commandExists("go") ? "go" : null,
@@ -420,9 +473,40 @@ function bunVersionAtLeast1(versionOutput: string): boolean {
  *     reason.
  *   - `ctx_upgrade` — separate path, must stay on Node for the same reason.
  */
+/**
+ * Liveness-guarded Node path for the hook-runtime fallback (issue #841).
+ *
+ * `process.execPath` is pinned into every baked hook command because PATH
+ * resolution is unreliable for hooks (#190 snap-Node re-invokes the wrapper;
+ * #369 Windows Git Bash / MSYS can't resolve a bare `node`). But under a
+ * version manager (mise / asdf / nvm) execPath is a *version-pinned* absolute
+ * path — e.g. `~/.local/share/mise/installs/node/20.1.0/bin/node`. A routine
+ * `mise upgrade node` installs the next patch and DELETES the 20.1.0 dir, so
+ * the cached path dangles and every hook spawn fails with ENOENT — silently
+ * killing context-mode for that user.
+ *
+ * Same liveness-guard shape as the #800/#803 fix in
+ * {@link resolveJavascriptRuntime}: use the pinned execPath IFF it still
+ * exists on disk (preserving the #190/#369 reasons it was pinned), otherwise
+ * re-resolve a working `node` from PATH. The version manager's shim dir is on
+ * PATH and always points at the current patch, so bare `node` heals the host
+ * without a re-install. Falls back to the (stale) execPath only when no PATH
+ * node is reachable either — a strictly-better last resort than a dangling
+ * versioned path, and the doctor/upgrade flows surface the actionable error.
+ */
+function liveNodeRuntime(): HookRuntime {
+  if (existsSync(process.execPath)) {
+    return { path: process.execPath, isBun: false };
+  }
+  if (commandExists("node")) {
+    return { path: "node", isBun: false };
+  }
+  return { path: process.execPath, isBun: false };
+}
+
 export function resolveHookRuntime(): HookRuntime {
   if (_hookRuntimeCache) return _hookRuntimeCache;
-  const nodeFallback: HookRuntime = { path: process.execPath, isBun: false };
+  const nodeFallback: HookRuntime = liveNodeRuntime();
   try {
     if (!bunExists()) {
       _hookRuntimeCache = nodeFallback;

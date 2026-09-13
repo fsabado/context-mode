@@ -25,7 +25,8 @@ import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, open
  * redirect action — prevents agent from getting stuck when MCP tools
  * are unavailable. Applies to deny and modify actions that mention MCP alternatives.
  */
-function mcpRedirect(result) {
+function mcpRedirect(result, mcpToolsAvailable = true) {
+  if (!mcpToolsAvailable) return null;
   if (!isMCPReady()) return null;
   return result;
 }
@@ -71,6 +72,37 @@ function getExternalMcpNudgeEvery() {
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < EXTERNAL_MCP_NUDGE_MIN || parsed > EXTERNAL_MCP_NUDGE_MAX) {
     return EXTERNAL_MCP_NUDGE_DEFAULT;
+  }
+  return parsed;
+}
+
+// #817: size threshold so small Bash calls skip the routing nudge.
+//
+// PreToolUse fires BEFORE the command runs, so the actual output size is
+// unknowable here. The only deterministic pre-execution signal is the command
+// string itself. The Gemini CLI adapter solves the same over-interception
+// problem with a matcher that only fires on large-output tools — "avoids
+// unnecessary hook overhead on lightweight tools" (README). We mirror that at
+// the routing layer: when CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES is set to
+// N>0, an unbounded Bash command whose UTF-8 byte length is below N is treated
+// as expected-lightweight and the generic routing nudge is suppressed.
+//
+// Default is 0 (unset) → CURRENT BEHAVIOR: every unbounded command is nudged.
+// This preserves the context-saving guarantee for large outputs by default —
+// the threshold is strictly opt-in. Bounds [0, 100000]; invalid/zero/negative
+// values fall back to 0 (disabled). The threshold gates ONLY the generic Bash
+// nudge — curl/wget, inline-HTTP, and build-tool redirects run earlier and are
+// never relaxed, because those are deterministic floods regardless of command
+// length.
+const BASH_NUDGE_MIN_BYTES_ENV = "CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES";
+const BASH_NUDGE_MIN_BYTES_MAX = 100_000;
+
+function getBashNudgeMinCommandBytes() {
+  const raw = process.env[BASH_NUDGE_MIN_BYTES_ENV];
+  if (raw == null || raw === "") return 0;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > BASH_NUDGE_MIN_BYTES_MAX) {
+    return 0;
   }
   return parsed;
 }
@@ -476,6 +508,14 @@ const TOOL_ALIASES = {
   "grep_search": "Grep",
   "search_file_content": "Grep",
   "web_fetch": "WebFetch",
+  "read_url_content": "WebFetch",
+  // Antigravity CLI (`agy`) native tool names. Keep in sync with the two other
+  // agy maps: hooks/antigravity-cli/payload.mjs (normalizeAgyToolName) and
+  // src/session/extract.ts (TOOL_NAME_NORMALIZE).
+  "run_command": "Bash",
+  "view_file": "Read",
+  "list_dir": "LS",
+  "search_web": "WebSearch",
   // Qwen Code additional tool names (no routing branch yet but normalized
   // so future routing logic works without per-platform fallback):
   "write_file": "Write",
@@ -580,6 +620,24 @@ function getShellCommand(toolInput) {
   if (!toolInput || typeof toolInput !== "object") return "";
   if (typeof toolInput.command === "string") return toolInput.command;
   if (typeof toolInput.cmd === "string") return toolInput.cmd;
+  if (typeof toolInput.CommandLine === "string") return toolInput.CommandLine;
+  return "";
+}
+
+function getReadFilePath(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (typeof toolInput.file_path === "string") return toolInput.file_path;
+  if (typeof toolInput.path === "string") return toolInput.path;
+  if (typeof toolInput.AbsolutePath === "string") return toolInput.AbsolutePath;
+  if (typeof toolInput.FilePath === "string") return toolInput.FilePath;
+  return "";
+}
+
+function getWebFetchUrl(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (typeof toolInput.url === "string") return toolInput.url;
+  if (typeof toolInput.URL === "string") return toolInput.URL;
+  if (typeof toolInput.Url === "string") return toolInput.Url;
   return "";
 }
 
@@ -604,8 +662,14 @@ function getPlatformSettingsPath(platform) {
  * @param {string} [sessionId] - Stable session identifier from hook payload. When
  *   provided, the guidance throttle uses it to scope marker files across hook
  *   invocations even when process.ppid shifts (Windows/Git Bash — see #298).
+ * @param {object} [options] - Runtime routing context from the adapter.
+ * @param {boolean} [options.mcpToolsAvailable=true] - False when the current
+ *   caller context cannot invoke ctx_* MCP tools even though an MCP server is
+ *   live on the machine (Claude Code fixed-tool subagents — #794).
  */
-export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId) {
+export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId, options = {}) {
+  const mcpToolsAvailable = options.mcpToolsAvailable !== false;
+
   // ─── Opt-in fail-closed gate (#468 follow-up) ───
   // Default behavior on security-module load failure is fail-OPEN (a stderr
   // warning is emitted but routing continues). Security-conscious users can
@@ -715,7 +779,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
             bytesAvoided: 8192,
             commandSummary: command.slice(0, 200),
           },
-        });
+        }, mcpToolsAvailable);
       }
       // All segments safe → allow through
       return null;
@@ -737,7 +801,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         updatedInput: {
           command: `echo "context-mode: Inline HTTP redirected. Call ${t("ctx_execute")}(language, code) to fetch, derive your answer in code, and console.log() only the result — the raw response body stays in the sandbox instead of entering your conversation. Full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)."`,
         },
-      });
+      }, mcpToolsAvailable);
     }
 
     // Build tools (gradle, maven, sbt) → redirect to execute sandbox (Issue #38, #406).
@@ -750,7 +814,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         updatedInput: {
           command: `echo "context-mode: Build tool redirected. Call ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run the build and print only the tail — the verbose build log stays in the sandbox instead of entering your conversation. For more targeted output, replace \\"tail -30\\" with \\"grep -E '(error|warning|FAIL|✗|×)'\\" or similar, so only the lines that matter come back."`,
         },
-      });
+      }, mcpToolsAvailable);
     }
 
     // Skip the routing nudge for commands whose output is structurally
@@ -758,6 +822,17 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     // Conservative: any pipe/redirect/chain disqualifies, unknown commands
     // still get the nudge.
     if (isStructurallyBounded(command)) {
+      return null;
+    }
+
+    // #817: opt-in size threshold. When the operator configures
+    // CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES, a short unbounded command is
+    // treated as expected-lightweight and passes through untouched — reserving
+    // the nudge for commands large/complex enough to plausibly flood context.
+    // Default (0) preserves current behavior, so large-output savings are not
+    // weakened unless the operator explicitly opts in.
+    const minCommandBytes = getBashNudgeMinCommandBytes();
+    if (minCommandBytes > 0 && Buffer.byteLength(command, "utf8") < minCommandBytes) {
       return null;
     }
 
@@ -771,7 +846,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   // event with the actual file size as bytes_avoided. Threshold = 50 000 bytes;
   // smaller reads stay on the existing one-shot guidance nudge.
   if (canonical === "Read") {
-    const filePath = toolInput.file_path ?? toolInput.path ?? "";
+    const filePath = getReadFilePath(toolInput);
     if (filePath) {
       try {
         const st = statSync(filePath);
@@ -798,7 +873,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── WebFetch: deny + redirect to sandbox ───
   if (canonical === "WebFetch") {
-    const url = toolInput.url ?? "";
+    const url = getWebFetchUrl(toolInput);
     return mcpRedirect({
       action: "deny",
       reason: `context-mode: WebFetch redirected. Call ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch + index the page, then ${t("ctx_search")}(queries: [...]) to query the indexed content — the raw page bytes stay in storage instead of entering your conversation. Or call ${t("ctx_execute")}(language, code) when you want to derive your answer in one round trip (parse, extract, count) without persisting the response. Both have full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH).`,
@@ -811,7 +886,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         bytesAvoided: 16384,
         commandSummary: String(url).slice(0, 200),
       },
-    });
+    }, mcpToolsAvailable);
   }
 
   // ─── Agent: inject context-mode routing into subagent prompts ───
@@ -842,6 +917,11 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── MCP execute: security check for shell commands ───
   // Match bare, generic MCP, and legacy context-mode execute tool names.
+  const shouldPinClaudeExecutorCwd =
+    platform === "claude-code" &&
+    typeof projectDir === "string" &&
+    projectDir.length > 0;
+
   if (matchesContextModeTool(toolName, "ctx_execute", "execute")) {
     if (security && toolInput.language === "shell") {
       const code = toolInput.code ?? "";
@@ -855,6 +935,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
           return { action: "ask" };
         }
       }
+    }
+    if (toolInput.language === "shell" && shouldPinClaudeExecutorCwd && typeof toolInput.cwd !== "string") {
+      return { action: "modify", updatedInput: { ...toolInput, cwd: projectDir } };
     }
     return null;
   }
@@ -906,6 +989,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
           }
         }
       }
+    }
+    if (shouldPinClaudeExecutorCwd && typeof toolInput.cwd !== "string") {
+      return { action: "modify", updatedInput: { ...toolInput, cwd: projectDir } };
     }
     return null;
   }

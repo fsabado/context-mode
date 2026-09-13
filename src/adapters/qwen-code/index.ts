@@ -124,6 +124,19 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
           ],
         },
       ],
+      // Stop fires at end-of-turn. The qwen-specific stop hook records a
+      // turn_end marker AND captures per-turn token cost by tailing the session
+      // chats JSONL (~/.qwen/tmp/<hash>/chats/<sessionId>.jsonl) — usage is not
+      // reachable through hook stdin (usage.ts matrix §4). Points at the
+      // qwen-code/ hook dir (not the shared root) so it sets the qwen platform.
+      Stop: [
+        {
+          matcher: "",
+          hooks: [
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/qwen-code/stop.mjs`) },
+          ],
+        },
+      ],
     };
   }
 
@@ -154,7 +167,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
     const settings = this.readSettings();
     const hooks = (settings?.hooks ?? {}) as Record<string, unknown>;
 
-    for (const hookName of ["PreToolUse", "PostToolUse", "SessionStart", "PreCompact", "UserPromptSubmit"]) {
+    for (const hookName of ["PreToolUse", "PostToolUse", "SessionStart", "PreCompact", "UserPromptSubmit", "Stop"]) {
       const configured = Array.isArray(hooks[hookName]) && (hooks[hookName] as unknown[]).length > 0;
       results.push({
         check: `${hookName} hook`,
@@ -316,6 +329,15 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
       {
         name: "UserPromptSubmit",
         script: "userpromptsubmit.mjs",
+        matcher: "",
+      },
+      {
+        // Stop captures per-turn token cost by tailing the session chats JSONL
+        // (usage is unreachable through hook stdin). Routes to the qwen-code/
+        // hook dir so it sets the qwen platform — keep in sync with
+        // generateHookConfig above.
+        name: "Stop",
+        script: "qwen-code/stop.mjs",
         matcher: "",
       },
     ];

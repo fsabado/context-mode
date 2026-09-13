@@ -77,18 +77,60 @@ if (typeof globalThis.Bun === "undefined" && process.platform === "linux") {
       stdio: ["pipe", "inherit", "inherit"],
       env: process.env,
     });
+    const _keepAlive = setInterval(() => {}, 2147483647);
+    let _escTerm;
+    let _escKill;
+    let _tearingDown = false;
+    // #862: propagate parent death to the Bun child. When the MCP client (e.g.
+    // Claude Code) exits, its end of our stdin pipe closes. The original proxy
+    // ignored that ("end" was a no-op) and parked forever — so the child was
+    // never told the session was gone: its stdin (this pipe) stayed open and its
+    // direct parent (us) stayed alive, defeating BOTH paths of the child's
+    // lifecycle guard (the stdio-EOF assist AND the ppid poll). The pair
+    // orphaned to init and pinned a CPU core indefinitely. We now forward EOF
+    // (graceful self-reap via the child's own watchdog), then escalate
+    // SIGTERM → SIGKILL so a wedged child can never outlive its client. Still
+    // re-execs under Bun first, so #564's SIGSEGV avoidance is untouched.
+    const teardown = () => {
+      if (_tearingDown) return;
+      _tearingDown = true;
+      clearInterval(_keepAlive);
+      try {
+        if (child.stdin && !child.stdin.destroyed) child.stdin.end();
+      } catch {}
+      // NOT unref'd: these short-lived timers are what hold the event loop
+      // open through the teardown window (≤5 s). Liveness must not depend on
+      // the top-level `await new Promise()` below surviving a future refactor
+      // — if escalation is ever skipped, #862's orphan returns. child.on(
+      // "exit") clears both the instant the child reaps cleanly.
+      _escTerm = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+      }, 2000);
+      _escKill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        process.exit(0);
+      }, 5000);
+    };
     process.stdin.on("data", (chunk) => {
       if (!child.stdin.destroyed) child.stdin.write(chunk);
     });
-    process.stdin.on("end", () => {});
-    const _keepAlive = setInterval(() => {}, 2147483647);
+    // EOF, pipe close, or pipe error all mean the client is gone — tear down.
+    process.stdin.on("end", teardown);
+    process.stdin.on("close", teardown);
+    process.stdin.on("error", teardown);
     child.on("exit", (code) => {
       clearInterval(_keepAlive);
+      if (_escTerm) clearTimeout(_escTerm);
+      if (_escKill) clearTimeout(_escKill);
       process.exit(code ?? 0);
     });
     // Prevent rest of start.mjs from running — child owns the MCP session.
     process.stdin.resume();
-    await new Promise(() => {}); // park this process forever
+    await new Promise(() => {}); // park until the child exits (see child 'exit')
   }
 }
 
@@ -445,21 +487,51 @@ import "./hooks/ensure-deps.mjs";
   const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
   const IS_WIN32 = process.platform === "win32";
   const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
+  const NPM_FLAGS = ["--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"];
+  // #861: on Windows the npm shim is `npm.cmd`, which needs `shell: true` to
+  // run — but Node DROPS the `cwd` option when `shell: true`, so the spawned
+  // cmd.exe inherits an arbitrary working dir (C:\Windows under Claude Code).
+  // `npm install` then tries to create `C:\Windows\node_modules` → EPERM on
+  // every boot, and a cmd.exe window flashes each time. Prefer running npm's
+  // own CLI through node directly (no `.cmd` shim, no shell): `shell: false`
+  // honors `cwd` and `windowsHide` suppresses the console window. Fall back to
+  // the shim only when npm-cli.js can't be located, so a working host (e.g. a
+  // POSIX layout where npm-cli.js isn't beside node) can never regress.
+  const NPM_CLI_JS = resolve(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  const useNodeCli = existsSync(NPM_CLI_JS);
   for (const pkg of NPM_INSTALL_BG_PKGS) {
     if (existsSync(resolve(__dirname, "node_modules", pkg))) continue;
     try {
-      const child = spawn(
-        NPM_BIN,
-        ["install", pkg, "--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"],
-        {
-          cwd: __dirname,
-          stdio: "ignore",
-          detached: true,
-          // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
-          shell: IS_WIN32,
-        },
-      );
-      child.on("error", () => { /* best effort — npm missing, broken cache, etc. */ });
+      const child = useNodeCli
+        ? spawn(process.execPath, [NPM_CLI_JS, "install", pkg, ...NPM_FLAGS], {
+            cwd: __dirname,
+            stdio: "ignore",
+            detached: true,
+            shell: false,
+            windowsHide: true,
+          })
+        : spawn(NPM_BIN, ["install", pkg, ...NPM_FLAGS], {
+            cwd: __dirname,
+            stdio: "ignore",
+            detached: true,
+            // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
+            shell: IS_WIN32,
+            windowsHide: true,
+          });
+      // #861: this EPERM was invisible for months behind stdio:"ignore" + an
+      // empty error handler. Surface both spawn failures and non-zero exits.
+      child.on("error", (err) => {
+        process.stderr.write(
+          `[context-mode] background install of ${pkg} failed to spawn: ${err?.message ?? err}\n`,
+        );
+      });
+      child.on("exit", (code) => {
+        if (code) {
+          process.stderr.write(
+            `[context-mode] background install of ${pkg} exited with code ${code}\n`,
+          );
+        }
+      });
       child.unref();
     } catch { /* best effort — never block MCP boot */ }
   }

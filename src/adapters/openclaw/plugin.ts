@@ -44,6 +44,7 @@ import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 
 import { WorkspaceRouter } from "./workspace-router.js";
+import { handleOpenclawUsageEvent } from "./usage.js";
 import { buildNodeCommand } from "../types.js";
 import { OPENCLAW_TOOL_DEFS } from "./mcp-tools.js";
 import type { OpenClawToolDef } from "./mcp-tools.js";
@@ -156,6 +157,16 @@ interface OpenClawPluginApi {
    * the type so we degrade silently on legacy hosts that pre-date this API.
    */
   registerTool?(tool: OpenClawToolDef, opts?: { optional?: boolean }): void;
+  /**
+   * Subscribe to the openclaw diagnostic-event bus (`model.usage` carries
+   * per-turn token usage + pre-computed costUsd — diagnostic-events.ts:1156).
+   * Some hosts surface `onDiagnosticEvent` directly on the activation `api`;
+   * others expose it only as a module export from
+   * `openclaw/plugin-sdk/diagnostic-runtime`. Typed loosely + optional so the
+   * plugin compiles and runs whether or not the host provides it (the SDK is
+   * not a dependency of this repo). Returns an unsubscribe function.
+   */
+  onDiagnosticEvent?(listener: (evt: unknown) => void): (() => void) | void;
   logger?: {
     info: (...args: unknown[]) => void;
     error: (...args: unknown[]) => void;
@@ -548,6 +559,63 @@ export default {
         }
       },
     );
+
+    // ── 2b. model.usage — Per-turn token + cost capture ──────
+    // openclaw emits a first-class `model.usage` diagnostic event once per turn
+    // carrying the full usage breakdown + a pre-computed costUsd. We subscribe
+    // to the diagnostic-event bus (NOT the tool-call hook — before/after_tool_call
+    // carry approval/policy data only, no token usage). The handler
+    // (handleOpenclawUsageEvent) is decoupled + unit-tested; it parses → builds →
+    // inserts and never throws.
+    //
+    // tsc-safe SDK access: `onDiagnosticEvent` comes from the openclaw plugin SDK
+    // (`openclaw/plugin-sdk/diagnostic-runtime`), which is NOT in this repo's
+    // node_modules — a static import would break the build. We resolve it at
+    // runtime two ways, both best-effort:
+    //   1. directly off the activation `api` if the host surfaces it there;
+    //   2. otherwise a guarded dynamic import via a COMPUTED specifier string
+    //      (TS treats it as Promise<any> and skips module resolution, mirroring
+    //      the pathToFileURL(...).href dynamic imports above). Missing SDK → no-op.
+    const subscribeDiagnostics = (
+      onDiag: (listener: (evt: unknown) => void) => unknown,
+    ): void => {
+      try {
+        onDiag((evt: unknown) => {
+          try {
+            const sid = sessionId; // snapshot to avoid race with session_start re-key
+            handleOpenclawUsageEvent(evt, (e) => db.insertEvent(sid, e as SessionEvent, "Diagnostic"));
+          } catch {
+            // Usage capture must never break the agent turn.
+          }
+        });
+        log.debug("model.usage diagnostic subscription registered");
+      } catch (err) {
+        log.warn?.("model.usage diagnostic subscription failed", err);
+      }
+    };
+
+    if (typeof api.onDiagnosticEvent === "function") {
+      subscribeDiagnostics(api.onDiagnosticEvent.bind(api));
+    } else {
+      // Computed specifier so NodeNext does not try to resolve the (absent) SDK
+      // module at build time — the dynamic import is typed as Promise<any>.
+      const diagnosticRuntimeSpecifier = ["openclaw", "plugin-sdk", "diagnostic-runtime"].join("/");
+      void (async () => {
+        try {
+          const mod = (await import(diagnosticRuntimeSpecifier)) as {
+            onDiagnosticEvent?: (listener: (evt: unknown) => void) => unknown;
+          };
+          if (typeof mod?.onDiagnosticEvent === "function") {
+            subscribeDiagnostics(mod.onDiagnosticEvent);
+          } else {
+            log.debug("diagnostic-runtime loaded but onDiagnosticEvent missing");
+          }
+        } catch {
+          // SDK not installed (dev/test) — usage capture silently inert.
+          log.debug("openclaw plugin-sdk/diagnostic-runtime unavailable — usage capture inert");
+        }
+      })();
+    }
 
     // ── 3. command:new — Session initialization ────────────
 

@@ -9,6 +9,7 @@ import {
   readFileSync,
   mkdtempSync,
   rmSync,
+  utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -26,6 +27,7 @@ let routePreToolUse: (
   projectDir?: string,
   platform?: string,
   sessionId?: string,
+  options?: { mcpToolsAvailable?: boolean },
 ) => {
   action: string;
   reason?: string;
@@ -33,10 +35,10 @@ let routePreToolUse: (
   additionalContext?: string;
 } | null;
 
-let resetGuidanceThrottle: () => void;
+let resetGuidanceThrottle: (sessionId?: string) => void;
 let initSecurity: (buildDir: string) => Promise<boolean>;
 let ROUTING_BLOCK: string;
-let createRoutingBlock: (t: any, options?: { includeCommands?: boolean }) => string;
+let createRoutingBlock: (t: any, options?: { includeCommands?: boolean; toolSearchBootstrap?: boolean }) => string;
 let READ_GUIDANCE: string;
 let GREP_GUIDANCE: string;
 
@@ -101,6 +103,21 @@ describe("routePreToolUse", () => {
         undefined,
         "codex",
         "codex-cmd-curl",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect((result!.updatedInput as Record<string, string>).command).toContain(
+        "curl/wget redirected",
+      );
+    });
+
+    it("denies agy run_command CommandLine payloads like Bash command payloads", () => {
+      const result = routePreToolUse(
+        "run_command",
+        { CommandLine: "curl https://example.com" },
+        undefined,
+        "antigravity-cli",
+        "agy-commandline-curl",
       );
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
@@ -322,6 +339,20 @@ describe("routePreToolUse", () => {
       expect(result!.action).toBe("context");
       expect(result!.additionalContext).toBe(READ_GUIDANCE);
     });
+
+    it("treats agy view_file AbsolutePath payloads as Read", () => {
+      resetGuidanceThrottle("agy-view-file");
+      const result = routePreToolUse(
+        "view_file",
+        { AbsolutePath: "/some/file.ts" },
+        undefined,
+        "antigravity-cli",
+        "agy-view-file",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("context");
+      expect(result!.additionalContext).toContain("ctx_execute_file");
+    });
   });
 
   // ─── Grep routing ──────────────────────────────────────
@@ -364,6 +395,23 @@ describe("routePreToolUse", () => {
       expect(result!.reason).toContain(url);
     });
 
+    it("treats agy read_url_content URL payloads as WebFetch", () => {
+      const url = "https://example.com/docs";
+      const result = routePreToolUse(
+        "read_url_content",
+        { URL: url },
+        undefined,
+        "antigravity-cli",
+        "agy-read-url",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("deny");
+      expect(result!.reason).toContain(url);
+      // agy's call surface is context-mode/<tool> (see hooks/core/tool-naming.mjs),
+      // not Claude's mcp__context-mode__<tool> form.
+      expect(result!.reason).toContain("context-mode/ctx_fetch_and_index");
+    });
+
     it("treats mcp_web_fetch as WebFetch and blocks it", () => {
       const url = "https://example.com";
       const result = routePreToolUse("mcp_web_fetch", { url });
@@ -396,6 +444,52 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("mcp_web_fetch", { url: "https://example.com" });
       expect(result).toBeNull();
     });
+
+    it("passes WebFetch through when the caller context cannot invoke ctx_* tools (#794)", () => {
+      const result = routePreToolUse(
+        "WebFetch",
+        { url: "https://example.com" },
+        undefined,
+        "claude-code",
+        "subagent-webfetch",
+        { mcpToolsAvailable: false },
+      );
+      expect(result).toBeNull();
+    });
+
+    it("keeps WebFetch redirected when options are omitted", () => {
+      const result = routePreToolUse(
+        "WebFetch",
+        { url: "https://example.com" },
+        undefined,
+        "claude-code",
+        "main-webfetch-default-options",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("deny");
+      expect(result!.reason).toContain("ctx_fetch_and_index");
+    });
+
+    it("Claude Code pretooluse treats subagent hook payloads as ctx_* unavailable (#794)", async () => {
+      const main = await spawnPreToolUseHook({
+        tool_name: "WebFetch",
+        tool_input: { url: "https://example.com" },
+        session_id: "core-routing-main-webfetch",
+      });
+      expect(main.status).toBe(0);
+      expect(main.parsed?.hookSpecificOutput?.permissionDecision).toBe("deny");
+      expect(main.parsed?.hookSpecificOutput?.permissionDecisionReason).toContain("ctx_fetch_and_index");
+
+      const subagent = await spawnPreToolUseHook({
+        tool_name: "WebFetch",
+        tool_input: { url: "https://example.com" },
+        session_id: "core-routing-subagent-webfetch",
+        agent_id: "agent-794",
+        agent_type: "claude-code-guide",
+      });
+      expect(subagent.status).toBe(0);
+      expect(subagent.stdout).toBe("");
+    });
   });
 
   // ─── MCP readiness: all redirects degrade gracefully (#230) ───
@@ -418,6 +512,27 @@ describe("routePreToolUse", () => {
       const result = routePreToolUse("Bash", { command: "./gradlew build" });
       expect(result).toBeNull();
     });
+
+    it("allows MCP-backed redirects when the caller context cannot invoke ctx_* tools", () => {
+      const cases = [
+        ["Bash", { command: "curl https://example.com" }],
+        ["Bash", { command: "node -e \"fetch('https://example.com')\"" }],
+        ["Bash", { command: "./gradlew build" }],
+        ["WebFetch", { url: "https://example.com" }],
+      ] as const;
+
+      for (const [tool, input] of cases) {
+        const result = routePreToolUse(
+          tool,
+          input,
+          undefined,
+          "claude-code",
+          `subagent-${tool}`,
+          { mcpToolsAvailable: false },
+        );
+        expect(result).toBeNull();
+      }
+    });
   });
 
   // ─── Subagent ctx_commands omission (#233) ──────────────
@@ -433,6 +548,19 @@ describe("routePreToolUse", () => {
       const prompt = (result!.updatedInput as Record<string, string>).prompt;
       expect(prompt).not.toContain("<ctx_commands>");
       expect(prompt).toContain("<tool_selection_hierarchy>");
+    });
+
+    it("injects Claude Code Agent routing and ToolSearch bootstrap by default", () => {
+      const result = routePreToolUse("Agent", {
+        prompt: "Research this repository",
+        subagent_type: "general-purpose",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      const prompt = (result!.updatedInput as Record<string, string>).prompt;
+      expect(prompt).toContain("<context_window_protection>");
+      expect(prompt).toContain("ToolSearch");
+      expect(prompt).not.toContain("<ctx_commands>");
     });
 
     it("ROUTING_BLOCK constant includes ctx_commands for main session", () => {
@@ -511,6 +639,45 @@ describe("routePreToolUse", () => {
           commands: [{ label: "test", command: "ls -la" }],
           queries: ["file list"],
         },
+      );
+      expect(result).toBeNull();
+    });
+
+    it("pins Claude Code ctx_execute shell cwd from hook projectDir (#756)", () => {
+      const result = routePreToolUse(
+        "mcp__plugin_context-mode_context-mode__ctx_execute",
+        { language: "shell", code: "pwd" },
+        "/worktree/repo",
+        "claude-code",
+      );
+      expect(result?.action).toBe("modify");
+      expect(result?.updatedInput).toEqual({
+        language: "shell",
+        code: "pwd",
+        cwd: "/worktree/repo",
+      });
+    });
+
+    it("pins Claude Code ctx_batch_execute cwd from hook projectDir (#756)", () => {
+      const result = routePreToolUse(
+        "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+        { commands: [{ label: "branch", command: "git rev-parse --abbrev-ref HEAD" }] },
+        "/worktree/repo",
+        "claude-code",
+      );
+      expect(result?.action).toBe("modify");
+      expect(result?.updatedInput).toEqual({
+        commands: [{ label: "branch", command: "git rev-parse --abbrev-ref HEAD" }],
+        cwd: "/worktree/repo",
+      });
+    });
+
+    it("does not overwrite explicit ctx_execute cwd", () => {
+      const result = routePreToolUse(
+        "mcp__plugin_context-mode_context-mode__ctx_execute",
+        { language: "shell", code: "pwd", cwd: "/explicit" },
+        "/worktree/repo",
+        "claude-code",
       );
       expect(result).toBeNull();
     });
@@ -852,6 +1019,15 @@ function createSentinel(pidOrLabel: number | string, content?: string): string {
   return path;
 }
 
+// #844: isMCPReady() only cleans up a dead-PID sentinel once it is OLDER than
+// the freshness window (a recently-refreshed sentinel may belong to a live
+// server in another PID namespace). Age a sentinel past that window so the
+// stale-cleanup path is exercised deterministically.
+function ageSentinel(path: string): void {
+  const tenMinAgoSec = Date.now() / 1000 - 600;
+  utimesSync(path, tenMinAgoSec, tenMinAgoSec);
+}
+
 function hasUnrelatedLiveSentinel(): boolean {
   try {
     const dir = sentinelDir();
@@ -937,21 +1113,45 @@ describe.skipIf(POLLUTED)("mcp-ready: stale-cleanup self-healing", () => {
     fixtures.clear();
   });
 
-  it("unlinks a sentinel whose PID is dead", () => {
+  it("unlinks a STALE sentinel whose PID is dead", () => {
     const path = createSentinel(DEAD_PID);
+    ageSentinel(path);
     isMCPReady();
     expect(existsSync(path)).toBe(false);
     fixtures.delete(path);
   });
 
-  it("unlinks two dead sentinels in a single scan", () => {
+  it("unlinks two STALE dead sentinels in a single scan", () => {
     const a = createSentinel(DEAD_PID);
     const b = createSentinel(DEAD_PID - 1);
+    ageSentinel(a);
+    ageSentinel(b);
     expect(isMCPReady()).toBe(false);
     expect(existsSync(a)).toBe(false);
     expect(existsSync(b)).toBe(false);
     fixtures.delete(a);
     fixtures.delete(b);
+  });
+
+  // #844: a recently-refreshed sentinel must NOT be cleaned up even when its
+  // PID is invisible from this namespace (shared /tmp across PID namespaces).
+  it("keeps a FRESH dead/invisible-PID sentinel (#844 cross-namespace guard)", () => {
+    const path = createSentinel(DEAD_PID); // mtime = now → fresh
+    expect(isMCPReady()).toBe(true);
+    expect(existsSync(path)).toBe(true);
+    fixtures.delete(path);
+    try { unlinkSync(path); } catch { /* cleanup */ }
+  });
+
+  it("in one scan: keeps the FRESH sentinel and cleans the STALE one (#844)", () => {
+    const fresh = createSentinel(DEAD_PID);
+    const stale = createSentinel(DEAD_PID - 1);
+    ageSentinel(stale);
+    expect(isMCPReady()).toBe(true);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(stale)).toBe(false);
+    fixtures.delete(fresh);
+    try { unlinkSync(fresh); } catch { /* cleanup */ }
   });
 });
 
@@ -1102,6 +1302,25 @@ async function spawnRoutingProbe(
 ): Promise<{ status: number | null; stdout: string; parsed: any }> {
   const { spawnSync } = await import("node:child_process");
   const r = spawnSync("node", ["--input-type=module", "-e", code], {
+    encoding: "utf-8",
+    timeout: 15_000,
+    env: { ...process.env, ...env },
+  });
+  const stdout = (r.stdout ?? "").trim();
+  let parsed: any = null;
+  try { parsed = JSON.parse(stdout); } catch { /* surface raw */ }
+  return { status: r.status, stdout, parsed };
+}
+
+async function spawnPreToolUseHook(
+  input: Record<string, unknown>,
+  env: Record<string, string> = {},
+): Promise<{ status: number | null; stdout: string; parsed: any }> {
+  const { spawnSync } = await import("node:child_process");
+  const repoRoot = resolve(SLICE4_DIRNAME, "..", "..");
+  const r = spawnSync(process.execPath, ["hooks/pretooluse.mjs"], {
+    cwd: repoRoot,
+    input: JSON.stringify(input),
     encoding: "utf-8",
     timeout: 15_000,
     env: { ...process.env, ...env },

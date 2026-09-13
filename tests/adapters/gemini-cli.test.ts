@@ -242,6 +242,20 @@ describe("GeminiCLIAdapter", () => {
         "beforeagent.mjs",
       );
     });
+
+    it("generateHookConfig wires AfterModel into settings (matcher: '') so the host fires aftermodel.mjs", () => {
+      const config = adapter.generateHookConfig("/plugin/root") as Record<
+        string,
+        Array<{ matcher?: string; hooks?: Array<{ command?: string; type?: string }> }>
+      >;
+      expect(config["AfterModel"]).toBeDefined();
+      expect(config["AfterModel"].length).toBe(1);
+      expect(config["AfterModel"][0].matcher).toBe("");
+      expect(config["AfterModel"][0].hooks?.[0].type).toBe("command");
+      expect(config["AfterModel"][0].hooks?.[0].command).toContain(
+        "aftermodel.mjs",
+      );
+    });
   });
 
   // ── parseSessionStartInput ────────────────────────────

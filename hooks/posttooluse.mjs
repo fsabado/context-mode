@@ -21,7 +21,7 @@ await runHook(async () => {
     getInputProjectDir,
   } = await import("./session-helpers.mjs");
   const { createSessionLoaders, attributeAndInsertEvents } = await import("./session-loaders.mjs");
-  const { dirname, resolve } = await import("node:path");
+  const { dirname, resolve, basename } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
   const { readFileSync, unlinkSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -177,6 +177,44 @@ await runHook(async () => {
         }
       }
     } catch { /* latency tracking is best-effort */ }
+
+    // ─── Retrieval bridge: emit the "With context-mode" (bytes_retrieved) row ───
+    // The MCP server appended ctx_search / ctx_fetch_and_index response bytes to
+    // a marker keyed by the session DB basename (the hook NEVER fires for the
+    // plugin's own MCP tools, so this is the only place that signal can enter
+    // the forward stream). Consume + emit one forwardable event so the platform
+    // kept_out_pct goes "measured". Mirrors the redirect-marker handshake above.
+    try {
+      const marker = resolve(tmpdir(), `context-mode-retrieval-${basename(dbPath)}.txt`);
+      let retrievedBytes = 0;
+      try {
+        const raw = readFileSync(marker, "utf-8");
+        for (const line of raw.split("\n")) {
+          const n = parseInt(line, 10);
+          if (Number.isFinite(n) && n > 0) retrievedBytes += n;
+        }
+        unlinkSync(marker); // consume-once — next fire cannot re-forward
+      } catch { /* no marker — phantom-event guard */ }
+      if (retrievedBytes > 0) {
+        // session-loaders stamps bytes_retrieved onto the platform payload from
+        // this in-memory field (session_events has no such column — forward-only).
+        attributeAndInsertEvents(
+          db,
+          sessionId,
+          [{
+            type: "mcp_tool_call",
+            category: "retrieval",
+            data: `retrieval: ${retrievedBytes} bytes accessed`,
+            priority: 2,
+            bytes_retrieved: retrievedBytes,
+          }],
+          input,
+          projectDir,
+          "PostToolUse",
+          resolveProjectAttributions,
+        );
+      }
+    } catch { /* best-effort — never block the hook */ }
 
     db.close();
   } catch {

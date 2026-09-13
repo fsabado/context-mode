@@ -11,8 +11,10 @@ import { OpenCodeAdapter } from "../../src/adapters/opencode/index.js";
 import { OpenClawAdapter } from "../../src/adapters/openclaw/index.js";
 import { CodexAdapter } from "../../src/adapters/codex/index.js";
 import { VSCodeCopilotAdapter } from "../../src/adapters/vscode-copilot/index.js";
+import { CopilotCliAdapter } from "../../src/adapters/copilot-cli/index.js";
 import { CursorAdapter } from "../../src/adapters/cursor/index.js";
 import { AntigravityAdapter } from "../../src/adapters/antigravity/index.js";
+import { AntigravityCliAdapter } from "../../src/adapters/antigravity-cli/index.js";
 import { KiroAdapter } from "../../src/adapters/kiro/index.js";
 import { QwenCodeAdapter } from "../../src/adapters/qwen-code/index.js";
 import { JetBrainsCopilotAdapter } from "../../src/adapters/jetbrains-copilot/index.js";
@@ -62,6 +64,7 @@ describe("detectPlatform", () => {
     delete process.env.PI_CONFIG_DIR;
     delete process.env.PI_SESSION_FILE;
     delete process.env.PI_COMPILED;
+    delete process.env.PI_CODING_AGENT;
     delete process.env.PI_PROJECT_DIR;
     delete process.env.IDEA_INITIAL_DIRECTORY;
     delete process.env.IDEA_HOME;
@@ -250,7 +253,8 @@ describe("detectPlatform", () => {
   // refs/platforms/oh-my-pi/packages/coding-agent/src/mcp/transports/stdio.ts:55-63
   // — env passthrough only, no synthesis). Detection markers now use the
   // Pi-exclusive PI_CONFIG_DIR / PI_SESSION_FILE / PI_COMPILED set by
-  // the runtime.
+  // the runtime. Issue #760 adds PI_CODING_AGENT=true as the package-server
+  // marker Pi passes to its spawned MCP child.
 
   it("detects pi via PI_CONFIG_DIR env var", () => {
     process.env.PI_CONFIG_DIR = "/home/u/.pi";
@@ -261,6 +265,13 @@ describe("detectPlatform", () => {
 
   it("detects pi via PI_SESSION_FILE env var", () => {
     process.env.PI_SESSION_FILE = "/home/u/.pi/sessions/abc.json";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("pi");
+    expect(signal.confidence).toBe("high");
+  });
+
+  it("detects pi via PI_CODING_AGENT env var", () => {
+    process.env.PI_CODING_AGENT = "true";
     const signal = detectPlatform();
     expect(signal.platform).toBe("pi");
     expect(signal.confidence).toBe("high");
@@ -361,6 +372,18 @@ describe("detectPlatform", () => {
     expect(signal.reason).toContain("clientInfo");
   });
 
+  it("returns antigravity-cli when clientInfo name is agy", () => {
+    const signal = detectPlatform({ name: "agy", version: "1.0" });
+    expect(signal.platform).toBe("antigravity-cli");
+    expect(signal.confidence).toBe("high");
+  });
+
+  it("returns copilot-cli when clientInfo name is GitHub Copilot CLI", () => {
+    const signal = detectPlatform({ name: "GitHub Copilot CLI", version: "1.0" });
+    expect(signal.platform).toBe("copilot-cli");
+    expect(signal.confidence).toBe("high");
+  });
+
   it("returns kiro when clientInfo name is Kiro CLI", () => {
     const signal = detectPlatform({ name: "Kiro CLI", version: "1.0.0" });
     expect(signal.platform).toBe("kiro");
@@ -404,6 +427,22 @@ describe("detectPlatform", () => {
     process.env.CONTEXT_MODE_PLATFORM = "antigravity";
     const signal = detectPlatform();
     expect(signal.platform).toBe("antigravity");
+    expect(signal.confidence).toBe("high");
+    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
+  });
+
+  it("returns antigravity-cli when CONTEXT_MODE_PLATFORM=antigravity-cli", () => {
+    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("antigravity-cli");
+    expect(signal.confidence).toBe("high");
+    expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
+  });
+
+  it("returns copilot-cli when CONTEXT_MODE_PLATFORM=copilot-cli", () => {
+    process.env.CONTEXT_MODE_PLATFORM = "copilot-cli";
+    const signal = detectPlatform();
+    expect(signal.platform).toBe("copilot-cli");
     expect(signal.confidence).toBe("high");
     expect(signal.reason).toContain("CONTEXT_MODE_PLATFORM");
   });
@@ -479,7 +518,7 @@ describe("detectPlatform", () => {
   it("returns a valid platform as default when no env vars are set", () => {
     // No env vars set — result depends on which config dirs exist on this machine.
     const signal = detectPlatform();
-    expect(["claude-code", "gemini-cli", "codex", "cursor", "opencode", "kilo", "openclaw", "vscode-copilot", "antigravity", "kiro", "pi", "omp", "zed", "qwen-code", "jetbrains-copilot", "kimi"]).toContain(signal.platform);
+    expect(["claude-code", "gemini-cli", "codex", "cursor", "opencode", "kilo", "openclaw", "vscode-copilot", "copilot-cli", "antigravity", "antigravity-cli", "kiro", "pi", "omp", "zed", "qwen-code", "jetbrains-copilot", "kimi"]).toContain(signal.platform);
   });
 });
 
@@ -524,6 +563,11 @@ describe("getAdapter", () => {
     expect(adapter).toBeInstanceOf(VSCodeCopilotAdapter);
   });
 
+  it("returns CopilotCliAdapter for copilot-cli", async () => {
+    const adapter = await getAdapter("copilot-cli");
+    expect(adapter).toBeInstanceOf(CopilotCliAdapter);
+  });
+
   it("returns CursorAdapter for cursor", async () => {
     const adapter = await getAdapter("cursor");
     expect(adapter).toBeInstanceOf(CursorAdapter);
@@ -532,6 +576,11 @@ describe("getAdapter", () => {
   it("returns AntigravityAdapter for antigravity", async () => {
     const adapter = await getAdapter("antigravity");
     expect(adapter).toBeInstanceOf(AntigravityAdapter);
+  });
+
+  it("returns AntigravityCliAdapter for antigravity-cli", async () => {
+    const adapter = await getAdapter("antigravity-cli");
+    expect(adapter).toBeInstanceOf(AntigravityCliAdapter);
   });
 
   it("returns KiroAdapter for kiro", async () => {

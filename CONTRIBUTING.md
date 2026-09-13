@@ -297,6 +297,8 @@ npx skills add https://github.com/mksglu/context-mode/tree/main/.claude/skills/c
 | VS Code hooks | `tests/hooks/vscode-hooks.test.ts` |
 | JetBrains hooks | `tests/hooks/jetbrains-hooks.test.ts` |
 | Kiro hooks | `tests/hooks/kiro-hooks.test.ts` |
+| Copilot CLI hooks | `tests/hooks/copilot-cli-hooks.test.ts` |
+| Antigravity CLI hooks | `tests/hooks/antigravity-cli-hooks.test.ts` |
 | Session DB | `tests/session/session-db.test.ts` |
 | Session extract | `tests/session/session-extract.test.ts` |
 | Session snapshot | `tests/session/session-snapshot.test.ts` |

@@ -143,11 +143,32 @@ export const GEMINI_OPTS = {
   sessionIdEnv: undefined,
 };
 
+/**
+ * Antigravity CLI (`agy`) platform options. Shares the Gemini-family session
+ * root (~/.gemini/context-mode/sessions). agy supplies the conversation id and
+ * workspace path inside the hook payload (mapped to session_id/cwd before these
+ * opts are consulted), so no env-var fallbacks are needed.
+ */
+export const ANTIGRAVITY_CLI_OPTS = {
+  configDir: ".gemini",
+  configDirEnv: undefined,
+  projectDirEnv: undefined,
+  sessionIdEnv: undefined,
+};
+
 /** VS Code Copilot platform options. */
 export const VSCODE_OPTS = {
   configDir: ".vscode",
   configDirEnv: undefined,
   projectDirEnv: "VSCODE_CWD",
+  sessionIdEnv: undefined,
+};
+
+/** GitHub Copilot CLI platform options. */
+export const COPILOT_OPTS = {
+  configDir: ".copilot",
+  configDirEnv: "COPILOT_HOME",
+  projectDirEnv: undefined,
   sessionIdEnv: undefined,
 };
 

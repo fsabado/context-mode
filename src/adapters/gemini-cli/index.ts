@@ -269,6 +269,17 @@ export class GeminiCLIAdapter extends BaseAdapter implements HookAdapter {
           ],
         },
       ],
+      [GEMINI_HOOK_NAMES.AFTER_MODEL]: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "command",
+              command: buildGeminiHookCommand(GEMINI_HOOK_NAMES.AFTER_MODEL, pluginRoot),
+            },
+          ],
+        },
+      ],
       [GEMINI_HOOK_NAMES.PRE_COMPRESS]: [
         {
           matcher: "",

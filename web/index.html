@@ -43,6 +43,8 @@
   --serif:'Instrument Serif',Georgia,serif;
   --sans:'IBM Plex Sans',-apple-system,sans-serif;
   --mono:'IBM Plex Mono','SF Mono',monospace;
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  --ease-in-out:cubic-bezier(.77,0,.175,1);
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
@@ -401,6 +403,29 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
 .footer-links{font-size:14px;color:var(--text-3);margin-bottom:8px}
 .footer-meta{margin-top:18px;font-size:12px;color:var(--text-4)}
 .footer-addr{margin-top:24px;font-size:11px;color:var(--text-4);line-height:1.65}
+
+/* ═══ Motion polish · Emil design-engineering pass ═══ */
+.btn{transition:transform .12s var(--ease-out),background-color .15s var(--ease-out),color .15s var(--ease-out),border-color .15s var(--ease-out)}
+.topnav-item{transition:color .15s var(--ease-out),background-color .15s var(--ease-out)}
+.badge{transition:color .15s var(--ease-out),background-color .15s var(--ease-out),border-color .15s var(--ease-out)}
+.btn:active{transform:scale(.97)}
+.card:active,.solution-card:active{transform:scale(.99)}
+.btn:focus-visible,.topnav-item:focus-visible,.dropdown-item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rev{transition:opacity .5s var(--ease-out),transform .5s var(--ease-out)}
+.dropdown-menu{transform-origin:top left;transform:translateY(-4px) scale(.98);transition:opacity .15s var(--ease-out),transform .15s var(--ease-out),visibility .15s}
+.dropdown:hover .dropdown-menu,.dropdown:focus-within .dropdown-menu{transform:translateY(0) scale(1)}
+.dropdown .caret{transition:transform .15s var(--ease-out)}
+.dropdown:hover .caret,.dropdown:focus-within .caret{transform:rotate(180deg)}
+@media (hover:none){
+  .card:hover,.solution-card:hover,.surface:hover,.metric:hover{transform:none}
+}
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .rev{opacity:1 !important;transform:none !important;transition:none !important}
+  .btn:active,.card:active,.solution-card:active{transform:none}
+  .dropdown-menu,.dropdown:hover .dropdown-menu{transform:translateY(0) scale(1)}
+  .dropdown:hover .caret,.dropdown:focus-within .caret{transform:none}
+}
 </style>
 </head>
 <body>
@@ -416,7 +441,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
           <div class="dropdown-label">Platform</div>
           <a href="/insight" class="dropdown-item">
             <div class="dropdown-item-title">Context Mode<span class="italic">Insight</span></div>
-            <div class="dropdown-item-desc">Org observability for AI-assisted engineering <span class="badge-mini live">live · $20/seat</span></div>
+            <div class="dropdown-item-desc">Engineering signal for AI-assisted teams <span class="badge-mini live">live · $20/seat</span></div>
           </a>
           <a href="#" class="dropdown-item future" onclick="return false">
             <div class="dropdown-item-title">Context Mode<span class="italic">Memory</span></div>
@@ -446,15 +471,15 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
 <section class="hero">
   <div class="hero-inner wrap rev">
     <h1 class="cm-master">Context Mode<span class="cursor"></span></h1>
-    <p class="hero-tag"><span class="dot"></span>open-source plugin · commercial platform · <span id="stat-tag-users">287,000+</span> developers</p>
+    <p class="hero-tag"><span class="dot"></span>open-source plugin · commercial platform · <span id="stat-tag-users">331,200+</span> developers</p>
     <p class="hero-sub">
       <strong>The other half of the context problem</strong> — for developers and for engineering orgs.
       An MCP plugin that keeps raw data out of the LLM context window. A Platform that surfaces <em>what your team is doing</em>
       with the saved tokens. Same engine, two surfaces, your choice.
     </p>
     <div class="hero-stats">
-      <div class="hero-stat"><div class="val" id="stat-users">287k+</div><div class="lbl">developers</div></div>
-      <div class="hero-stat"><div class="val">15</div><div class="lbl">AI platforms</div></div>
+      <div class="hero-stat"><div class="val" id="stat-users">331.2k+</div><div class="lbl">developers</div></div>
+      <div class="hero-stat"><div class="val">17</div><div class="lbl">AI adapters</div></div>
       <div class="hero-stat"><div class="val">#1</div><div class="lbl">on Hacker News</div></div>
       <div class="hero-stat"><div class="val" id="stat-stars">—</div><div class="lbl">GitHub stars</div></div>
       <div class="hero-stat"><div class="val">OSS</div><div class="lbl">ELv2 license</div></div>
@@ -469,7 +494,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
           <span class="badge badge-dev"><span class="dot"></span>For developers · Free</span>
           <h3 class="card-title"><span class="prompt">$</span>context<span class="dash">-</span>mode<span class="cursor"></span></h3>
           <p class="card-description">
-            Keeps raw data <strong>out of the LLM context window</strong> on your machine. Save up to 98% of context per session. Works on Claude Code, Cursor, Copilot, Codex, Gemini, and 10 more.
+            Keeps raw data <strong>out of the LLM context window</strong> on your machine. Save up to 98% of context per session. Works on Claude Code, Cursor, Copilot, Codex, Gemini, and 12 more.
           </p>
         </div>
         <div class="card-content">
@@ -545,8 +570,8 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
           <strong>30× fewer tokens.</strong>
         </p>
         <p class="body">
-          Works on <em>15 platforms</em> — Claude Code, Cursor, Copilot, Codex, Gemini CLI, JetBrains Copilot, Kiro,
-          and 8 more. <strong><span class="js-user-count">287,000+</span> developers</strong> run it locally today.
+          Works on <em>17 adapters</em> — Claude Code, Cursor, Copilot, Codex, Gemini CLI, JetBrains Copilot, GitHub Copilot CLI, Antigravity CLI, Kiro,
+          and 8 more. <strong><span class="js-user-count">331,200+</span> developers</strong> run it locally today.
         </p>
         <div style="display:flex;gap:.625rem;margin-top:1.5rem;flex-wrap:wrap">
           <a href="/context-saving" class="btn btn-primary" style="background:var(--accent-dev);color:#fff">Full story · Context Saving →</a>
@@ -654,7 +679,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
         </div>
         <div class="card-content">
           <p class="card-description">
-            <strong>Org observability for AI-assisted engineering.</strong> Productive session rate per engineer. Retry waste per team. Patterns named, actions prescribed. Role-narrowed for CTO, EM, IC, CISO, FinOps, DevOps.
+            <strong>Engineering signal for AI-assisted teams.</strong> Productive session rate per engineer. Retry waste per team. Patterns named, actions prescribed. Role-narrowed for CTO, EM, IC, CISO, FinOps, DevOps.
           </p>
         </div>
         <div class="card-footer">
@@ -730,7 +755,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
         <span class="badge badge-dev"><span class="dot"></span>Dev surface · Free</span>
         <div class="surface-mark"><span class="prompt">$</span>context<span class="dash">-</span>mode<span class="cursor"></span></div>
         <p class="surface-desc">
-          <strong>The plugin.</strong> Runs locally. No account, no cloud, no network. The free workflow <span class="js-user-count">287,000+</span> developers ship code with every day.
+          <strong>The plugin.</strong> Runs locally. No account, no cloud, no network. The free workflow <span class="js-user-count">331,200+</span> developers ship code with every day.
         </p>
       </div>
       <div class="surface">

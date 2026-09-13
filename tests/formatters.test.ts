@@ -63,4 +63,5 @@ describe("formatDecision integration", () => {
     expect(result.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(result.hookSpecificOutput.permissionDecisionReason).toBeDefined();
   });
+
 });

@@ -796,8 +796,6 @@ describe("Intent Events", () => {
   // intentionally dropped from the intent schema — the renderer now
   // surfaces the raw user message via <recent_user_messages> so the
   // next LLM can still distinguish review/discuss tone end-to-end.
-  // The pie-chart in insight/server.mjs degrades gracefully when these
-  // modes are absent.
 });
 
 // ════════════════════════════════════════════

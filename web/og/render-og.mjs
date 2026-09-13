@@ -12,6 +12,7 @@ const ASSETS = [
   { src: 'master-og.html',  out: 'master.png'  },
   { src: 'insight-og.html', out: 'insight.png' },
   { src: 'context-saving-og.html', out: 'context-saving.png' },
+  { src: 'oss-og.html', out: 'oss.png' },
 ];
 
 const W = 1200, H = 630;

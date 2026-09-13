@@ -674,6 +674,8 @@ const S = {
   getMaxFileEdits: "getMaxFileEdits",
   getLatestCommitMessage: "getLatestCommitMessage",
   incrementCompactCount: "incrementCompactCount",
+  getUsageCursor: "getUsageCursor",
+  setUsageCursor: "setUsageCursor",
   upsertResume: "upsertResume",
   getResume: "getResume",
   markResumeConsumed: "markResumeConsumed",
@@ -887,6 +889,19 @@ export class SessionDB extends SQLiteBase {
       // best-effort migration only
     }
 
+    // Migration: per-session usage high-water cursor for the Stop hook's
+    // cursor-aware main-turn capture (extractTranscriptUsageSince). Stores the
+    // uuid of the last assistant turn already emitted so the next Stop forwards
+    // only NEW spend. Idempotent — guarded by a table_xinfo column check.
+    try {
+      const metaCols = this.db.pragma("table_xinfo(session_meta)") as Array<{ name: string }>;
+      if (!metaCols.some((c) => c.name === "usage_cursor")) {
+        this.db.exec("ALTER TABLE session_meta ADD COLUMN usage_cursor TEXT");
+      }
+    } catch {
+      // best-effort migration only
+    }
+
   }
 
   protected prepareStatements(): void {
@@ -1018,6 +1033,12 @@ export class SessionDB extends SQLiteBase {
 
     p(S.incrementCompactCount,
       `UPDATE session_meta SET compact_count = compact_count + 1 WHERE session_id = ?`);
+
+    p(S.getUsageCursor,
+      `SELECT usage_cursor FROM session_meta WHERE session_id = ?`);
+
+    p(S.setUsageCursor,
+      `UPDATE session_meta SET usage_cursor = ? WHERE session_id = ?`);
 
     // ── Resume ──
     p(S.upsertResume,
@@ -1217,9 +1238,14 @@ export class SessionDB extends SQLiteBase {
         .slice(0, 16)
         .toUpperCase();
       const attribution = attributions?.[i];
-      const projectDir = String(
+      // #827: store project_dir in canonical path shape so the search-time
+      // allow-set lookup (getSessionIdsForProject) matches regardless of the
+      // separator / trailing-slash form the host adapter happened to emit.
+      // normalizeWorktreePath is the same rule used for project-hash stability.
+      const rawProjectDir = String(
         attribution?.projectDir ?? event.project_dir ?? this._getSessionProjectDir(sessionId) ?? "",
       ).trim();
+      const projectDir = rawProjectDir === "" ? "" : normalizeWorktreePath(rawProjectDir);
       const attributionSource = String(
         attribution?.source ?? event.attribution_source ?? "unknown",
       );
@@ -1407,13 +1433,28 @@ export class SessionDB extends SQLiteBase {
    */
   getSessionIdsForProject(projectDir: string): string[] {
     try {
+      // #827: match by canonical path shape, not raw bytes. The host adapter
+      // may store `project_dir` in a different separator / trailing-slash
+      // shape than the search path resolves the scope in — most visibly on
+      // Windows, where attribution often carries `C:\Users\me\proj` while the
+      // server resolves `C:/Users/me/proj`. An exact `project_dir = ?` match
+      // then returned an EMPTY allow-set and ctx_search reported "No results
+      // found" even though the content was present. We fold BOTH sides through
+      // the same canonical rule used for project-hash stability
+      // (normalizeWorktreePath): backslash → forward slash, then strip the
+      // trailing slash. Normalizing in SQL (RTRIM(REPLACE(...))) covers rows
+      // already written un-normalized without a migration, while the JS-side
+      // normalize keeps the bound parameter in the identical shape. This
+      // preserves the #737 project scope — distinct directories still differ
+      // after normalization, so cross-project isolation is intact.
+      const normalized = normalizeWorktreePath(projectDir);
       const rows = this.db
         .prepare(
           `SELECT DISTINCT session_id
              FROM session_events
-            WHERE project_dir = ?`,
+            WHERE RTRIM(REPLACE(project_dir, '\\', '/'), '/') = ?`,
         )
-        .all(projectDir) as Array<{ session_id: string }>;
+        .all(normalized) as Array<{ session_id: string }>;
       return rows.map((r) => r.session_id);
     } catch {
       return [];
@@ -1491,6 +1532,24 @@ export class SessionDB extends SQLiteBase {
    */
   incrementCompactCount(sessionId: string): void {
     this.stmt(S.incrementCompactCount).run(sessionId);
+  }
+
+  /**
+   * Read the per-session usage high-water cursor — the uuid of the last
+   * assistant turn already emitted by the Stop hook's main-turn capture.
+   * Returns null when unset (first Stop) or the session row is absent.
+   */
+  getUsageCursor(sessionId: string): string | null {
+    const row = this.stmt(S.getUsageCursor).get(sessionId) as { usage_cursor: string | null } | undefined;
+    return row?.usage_cursor ?? null;
+  }
+
+  /**
+   * Advance the per-session usage high-water cursor to `uuid`. No-op when the
+   * session_meta row does not exist yet (callers ensureSession first).
+   */
+  setUsageCursor(sessionId: string, uuid: string): void {
+    this.stmt(S.setUsageCursor).run(uuid, sessionId);
   }
 
   // ═══════════════════════════════════════════

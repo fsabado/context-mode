@@ -361,3 +361,75 @@ describe("Slice 5: resolveProjectScope", () => {
     expect(scope2).toBeUndefined();
   });
 });
+
+// ═══════════════════════════════════════════════════════════
+// Slice 6: Issue #827 — project_dir matching is path-shape stable
+//
+// On Windows the host adapter writes session_events.project_dir in the
+// shape it observed (often backslash form, e.g. C:\Users\me\proj), while
+// the search path resolves the scope from the MCP server's getProjectDir()
+// which can differ by separator (C:/Users/me/proj) or trailing slash. The
+// original getSessionIdsForProject did an EXACT `project_dir = ?` match, so
+// the allow-set came back EMPTY and every chunk failed the allow-set test —
+// ctx_search returned "No results found" even though the content was there
+// (reproduced by Adriftnote/aaddrr on Windows 11, v1.0.162).
+//
+// The fix must NOT disable the #737 project scope (that would re-break the
+// shared-DB isolation the filter exists for). Instead, BOTH the stored
+// project_dir and the query project_dir are normalized canonically (the
+// same normalizeWorktreePath rule already used for project-hash stability,
+// src/session/db.ts:310) so equal directories compare equal regardless of
+// separator / trailing-slash shape.
+// ═══════════════════════════════════════════════════════════
+
+describe("Slice 6: getSessionIdsForProject path-shape normalization (#827)", () => {
+  test("matches when stored project_dir uses backslashes but query uses forward slashes (Windows shape)", () => {
+    const db = createSessionDB();
+    const sid = `s-win-${randomUUID()}`;
+
+    // Host adapter on Windows stored the backslash form...
+    db.ensureSession(sid, "C:\\Users\\me\\proj");
+    db.insertEvent(
+      sid,
+      { type: "x", category: "x", data: "win-evt", priority: 2 },
+      "PostToolUse",
+      { projectDir: "C:\\Users\\me\\proj", source: "env", confidence: 1 },
+    );
+
+    // ...but the search path resolved the scope with forward slashes.
+    const ids = db.getSessionIdsForProject("C:/Users/me/proj");
+    expect(ids).toEqual([sid]);
+  });
+
+  test("matches across trailing-slash difference", () => {
+    const db = createSessionDB();
+    const sid = `s-trail-${randomUUID()}`;
+
+    db.ensureSession(sid, "/home/me/proj");
+    db.insertEvent(
+      sid,
+      { type: "x", category: "x", data: "trail-evt", priority: 2 },
+      "PostToolUse",
+      { projectDir: "/home/me/proj/", source: "env", confidence: 1 },
+    );
+
+    const ids = db.getSessionIdsForProject("/home/me/proj");
+    expect(ids).toEqual([sid]);
+  });
+
+  test("still isolates distinct projects (does not over-match after normalization)", () => {
+    const db = createSessionDB();
+    const sA = `s-a-${randomUUID()}`;
+    const sB = `s-b-${randomUUID()}`;
+
+    db.ensureSession(sA, "C:\\work\\alpha");
+    db.ensureSession(sB, "C:\\work\\beta");
+    db.insertEvent(sA, { type: "x", category: "x", data: "_", priority: 2 },
+      "PostToolUse", { projectDir: "C:\\work\\alpha", source: "env", confidence: 1 });
+    db.insertEvent(sB, { type: "x", category: "x", data: "_", priority: 2 },
+      "PostToolUse", { projectDir: "C:\\work\\beta", source: "env", confidence: 1 });
+
+    expect(db.getSessionIdsForProject("C:/work/alpha")).toEqual([sA]);
+    expect(db.getSessionIdsForProject("C:/work/beta")).toEqual([sB]);
+  });
+});

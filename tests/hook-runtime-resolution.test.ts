@@ -66,7 +66,8 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 
@@ -91,7 +92,9 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
     vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-      return { ...actual, existsSync: () => false };
+      // The host's real process.execPath must read as live so the #841
+      // liveness guard passes it through; only bun candidates are absent.
+      return { ...actual, existsSync: (p: string | URL) => String(p) === process.execPath };
     });
 
     const { resolveHookRuntime, resetHookRuntimeCache } = await import("../src/runtime.js");
@@ -117,7 +120,8 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 
@@ -150,7 +154,8 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 
@@ -181,7 +186,8 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 
@@ -221,6 +227,141 @@ describe("resolveHookRuntime — auto-detect bun ≥1.0, fall back to node (#738
   });
 });
 
+// ─────────────────────────────────────────────────────────
+// #841: Hooks break after a mise/asdf/nvm Node *patch* upgrade.
+//
+// When bun is absent, resolveHookRuntime() falls back to process.execPath,
+// which under a version manager is a *version-pinned* absolute path
+// (e.g. ~/.local/share/mise/installs/node/20.1.0/bin/node). `mise upgrade
+// node` (also asdf/nvm) installs 20.1.1 and removes the 20.1.0 dir. The MCP
+// server caches the now-dangling 20.1.0 path; every baked hook command then
+// fails with spawn ENOENT and context-mode silently dies for that user.
+//
+// Extends the #800/#803 liveness-guard pattern (resolveJavascriptRuntime,
+// Homebrew Cellar ENOENT) to the HOOK runtime path: use the pinned execPath
+// IFF it exists on disk, else re-resolve a working `node` from PATH. The
+// reason execPath was pinned (#190 snap-node / #369 Windows MSYS PATH) is
+// preserved — a *live* execPath is still returned verbatim.
+// ─────────────────────────────────────────────────────────
+describe("resolveHookRuntime — liveness-guard stale version-manager execPath (#841)", () => {
+  let originalExecPath: string;
+
+  beforeEach(() => {
+    vi.resetModules();
+    originalExecPath = process.execPath;
+  });
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("node:fs");
+    Object.defineProperty(process, "execPath", {
+      value: originalExecPath,
+      configurable: true,
+    });
+  });
+
+  function stubExecPath(value: string): void {
+    Object.defineProperty(process, "execPath", {
+      value,
+      configurable: true,
+    });
+  }
+
+  // bunFallbackPaths() emits POSIX (~/.bun/bin/bun) AND Windows
+  // (\.bun\bin\bun.exe, \bun\bin\bun.exe) candidates. Block them all so
+  // bunExists() is false and the node fallback path is exercised.
+  // Algorithmic (no regex): true when the path contains a bun binary segment
+  // (…/bun/bin/bun or …/.bun/bin/bun), with either path separator. The
+  // original regex /[\\/]\.?bun[\\/]bin[\\/]bun/ required a leading separator
+  // before the segment, so a leading "/" is normalized in and both forms are
+  // covered by the two includes checks below.
+  const isBunBinaryPath = (p: string): boolean => {
+    const s = p.split("\\").join("/");
+    return s.includes("/bun/bin/bun") || s.includes("/.bun/bin/bun");
+  };
+
+  // Path shapes that the three popular version managers pin execPath to.
+  // After a patch upgrade the *old* directory is deleted, so existsSync
+  // returns false for these exact paths.
+  const STALE_PATHS: ReadonlyArray<[string, string]> = [
+    ["mise", "/home/dev/.local/share/mise/installs/node/20.1.0/bin/node"],
+    ["asdf", "/home/dev/.asdf/installs/nodejs/20.1.0/bin/node"],
+    ["nvm", "/home/dev/.nvm/versions/node/v20.1.0/bin/node"],
+  ];
+
+  for (const [manager, stalePath] of STALE_PATHS) {
+    test(`${manager}: stale pinned execPath (deleted after patch upgrade) → falls back to PATH node, never ENOENT`, async () => {
+      // Simulate a no-bun host whose process.execPath points at a Node
+      // version dir that the version manager has just deleted.
+      stubExecPath(stalePath);
+
+      const execSync = vi.fn((cmd: string) => {
+        if (cmd === "where bun" || cmd === "command -v bun") {
+          throw new Error("bun not found");
+        }
+        if (cmd === "command -v node") return "/home/dev/.local/share/mise/shims/node\n";
+        if (cmd === "where node") return "C:\\Program Files\\nodejs\\node.exe\n";
+        if (/^command -v\s/.test(cmd)) throw new Error("not found");
+        if (/^where\s/.test(cmd)) throw new Error("not found");
+        throw new Error(`unmocked execSync: ${cmd}`);
+      });
+      const execFileSync = vi.fn(() => Buffer.from("ok\n"));
+      // The pinned (stale) execPath does NOT exist; bun candidates don't either.
+      const existsSync = vi.fn(
+        (p: string | URL) => String(p) !== stalePath && !isBunBinaryPath(String(p)),
+      );
+
+      vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+      vi.doMock("node:fs", async () => {
+        const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+        return { ...actual, existsSync };
+      });
+
+      const { resolveHookRuntime, resetHookRuntimeCache } = await import("../src/runtime.js");
+      resetHookRuntimeCache();
+      const r = resolveHookRuntime();
+
+      // The bug: baking the stale version-pinned path → spawn ENOENT at hook
+      // run time. The guard must NEVER return the dangling path.
+      expect(r.path).not.toBe(stalePath);
+      // Must re-resolve a working node from PATH instead.
+      expect(r.path).toBe("node");
+      expect(r.isBun).toBe(false);
+    });
+  }
+
+  test("live pinned execPath is preserved verbatim — does NOT regress #190/#369", async () => {
+    // A current (un-upgraded) version-manager Node still exists on disk; the
+    // liveness guard must pass it through unchanged so the snap-node (#190)
+    // and Windows MSYS PATH (#369) reasons execPath was pinned still hold.
+    const livePath = "/home/dev/.local/share/mise/installs/node/20.1.0/bin/node";
+    stubExecPath(livePath);
+
+    const execSync = vi.fn((cmd: string) => {
+      if (cmd === "where bun" || cmd === "command -v bun") throw new Error("bun not found");
+      if (/^command -v\s/.test(cmd)) throw new Error("not found");
+      if (/^where\s/.test(cmd)) throw new Error("not found");
+      throw new Error(`unmocked execSync: ${cmd}`);
+    });
+    const execFileSync = vi.fn(() => Buffer.from("ok\n"));
+
+    vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      // Only the pinned execPath exists; no bun candidates.
+      return { ...actual, existsSync: (p: string | URL) => String(p) === livePath };
+    });
+
+    const { resolveHookRuntime, resetHookRuntimeCache } = await import("../src/runtime.js");
+    resetHookRuntimeCache();
+    const r = resolveHookRuntime();
+
+    expect(r.path).toBe(livePath);
+    expect(r.isBun).toBe(false);
+  });
+});
+
 describe("buildHookRuntimeCommand — emits bun when available, node otherwise (#738)", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -248,7 +389,8 @@ describe("buildHookRuntimeCommand — emits bun when available, node otherwise (
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 
@@ -273,7 +415,9 @@ describe("buildHookRuntimeCommand — emits bun when available, node otherwise (
     vi.doMock("node:child_process", () => ({ execSync, execFileSync }));
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-      return { ...actual, existsSync: () => false };
+      // Host process.execPath reads as live (#841 guard passes it through);
+      // bun candidates are absent → node fallback uses the pinned execPath.
+      return { ...actual, existsSync: (p: string | URL) => String(p) === process.execPath };
     });
 
     const { resetHookRuntimeCache } = await import("../src/runtime.js");
@@ -300,7 +444,8 @@ describe("buildHookRuntimeCommand — emits bun when available, node otherwise (
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 
@@ -337,7 +482,8 @@ describe("buildHookRuntimeCommand — emits bun when available, node otherwise (
         const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
         return {
           ...actual,
-          existsSync: (p: string | URL) => String(p) === fakeBun,
+          existsSync: (p: string | URL) =>
+            String(p) === fakeBun || String(p) === process.execPath,
         };
       });
 

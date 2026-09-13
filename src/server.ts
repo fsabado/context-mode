@@ -2,8 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
-import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, writeSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
+import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
@@ -20,7 +20,9 @@ import {
   evaluateCommandDenyOnly,
   extractShellCommands,
   readToolDenyPatterns,
+  readToolPermissionPatterns,
   evaluateFilePath,
+  evaluateProjectContainment,
 } from "./security.js";
 import {
   detectRuntimes,
@@ -29,7 +31,7 @@ import {
   hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
-import { startLifecycleGuard } from "./lifecycle.js";
+import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "./lifecycle.js";
 import { charSafePrefix } from "./truncate.js";
 import {
   describeStorageDirectorySource,
@@ -53,19 +55,23 @@ import {
   emitSandboxExecuteEvent,
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
+import { appendRetrievalBytes } from "./session/retrieval-marker.js";
 import { searchAllSources } from "./search/unified.js";
 import {
   buildCtxSearchInputSchema,
   CTX_SEARCH_SHARED_MODE,
   resolveProjectScope,
 } from "./search/ctx-search-schema.js";
+import { FloodGuard } from "./search/flood-guard.js";
 import { buildNodeCommand, type HookAdapter, type PlatformId, isInProcessPluginPlatform } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
+import { parseCodexContextModePluginRoot } from "./adapters/codex/index.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
+import { stripJsonComments } from "./util/jsonc.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -76,6 +82,42 @@ const VERSION: string = (() => {
   }
   return "unknown";
 })();
+
+function getPackageRoot(): string {
+  return existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
+}
+
+function resolveCodexRuntimePluginRoot(fallbackRoot: string): string {
+  try {
+    const probe = process.platform === "win32"
+      ? spawnSync("cmd.exe", ["/d", "/s", "/c", "codex plugin list"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+      })
+      : spawnSync("codex", ["plugin", "list"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+      });
+    if (probe.status !== 0) return fallbackRoot;
+    const runtimeRoot = parseCodexContextModePluginRoot(String(probe.stdout));
+    if (runtimeRoot && existsSync(resolve(runtimeRoot, ".codex-plugin", "hooks.json"))) {
+      return runtimeRoot;
+    }
+  } catch {
+    // Best effort only. Non-Codex hosts and older Codex builds may not expose
+    // plugin list; keep the package-root fallback for those environments.
+  }
+  return fallbackRoot;
+}
+
+function getRuntimeAwarePackageRoot(platformId?: PlatformId): string {
+  const packageRoot = getPackageRoot();
+  return platformId === "codex"
+    ? resolveCodexRuntimePluginRoot(packageRoot)
+    : packageRoot;
+}
 
 // Prevent silent MCP server death from unhandled async errors.
 //
@@ -89,7 +131,11 @@ if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
     process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
   });
   process.on("uncaughtException", (err) => {
-    process.stderr.write(`[context-mode] uncaughtException: ${err?.message ?? err}\n`);
+    try {
+      writeSync(2, `[context-mode] uncaughtException: ${err?.message ?? err}\n`);
+    } finally {
+      process.exit(1);
+    }
   });
 }
 
@@ -117,61 +163,6 @@ export function shouldSuppressMcpToolsForNativePluginHost(
   if (platform !== "opencode" && platform !== "kilo") return false;
   const settings = opts.settings ?? readNativePluginHostSettings(platform);
   return settingsHasContextModePlugin(settings) && settingsHasLegacyContextModeMcp(settings);
-}
-
-function stripJsonComments(str: string): string {
-  let out = "";
-  let inString = false;
-  let escaped = false;
-  let inBlockComment = false;
-
-  for (let i = 0; i < str.length; i++) {
-    const c = str[i];
-    const next = str[i + 1];
-
-    if (inBlockComment) {
-      if (c === "*" && next === "/") {
-        inBlockComment = false;
-        i++;
-      }
-      continue;
-    }
-
-    if (escaped) {
-      out += c;
-      escaped = false;
-      continue;
-    }
-
-    if (c === "\\") {
-      out += c;
-      escaped = inString;
-      continue;
-    }
-
-    if (c === '"') {
-      inString = !inString;
-      out += c;
-      continue;
-    }
-
-    if (!inString && c === "/" && next === "/") {
-      while (i < str.length && str[i] !== "\n") i++;
-      if (i < str.length) out += "\n";
-      continue;
-    }
-
-    if (!inString && c === "/" && next === "*") {
-      inBlockComment = true;
-      i++;
-      continue;
-    }
-
-    out += c;
-  }
-
-  return out
-    .replace(/,(\s*[}\]])/g, "$1");
 }
 
 function readNativePluginHostSettings(platform: PlatformId): Record<string, unknown> | null {
@@ -306,6 +297,10 @@ function wrapToolHandler(
   handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
 ): (toolArgs: Record<string, unknown>) => Promise<unknown> {
   return async (toolArgs: Record<string, unknown>) => {
+    // #854: mark a tool call in-flight so the bridge-child idle reaper never
+    // shuts the server down mid-execution during a long ctx_execute/batch that
+    // emits no further inbound messages. Symmetric end in finally (success+error).
+    noteRequestStart();
     try {
       return await handler(toolArgs);
     } catch (err) {
@@ -319,6 +314,8 @@ function wrapToolHandler(
         }
       }
       throw err;
+    } finally {
+      noteRequestEnd();
     }
   };
 }
@@ -353,6 +350,68 @@ server.server.registerCapabilities({ prompts: { listChanged: false }, resources:
 server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
 server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
 server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }));
+
+// ── Strict-client (Gemini function-calling) schema compatibility ──────────────
+// Gemini's function-calling API — used by Antigravity CLI (`agy`) and Gemini CLI
+// — rejects JSON Schema `const` and `additionalProperties`. A rejected parameter
+// schema makes the host SILENTLY DROP that tool from the model's function list,
+// so the agent never sees our ctx_* tools and falls back to hand-rolling the MCP
+// protocol through its Bash tool. Sanitize the EMITTED tools/list schema:
+//   • `const: X`  →  `enum: [X]`   — an identical single-value constraint
+//   • drop `additionalProperties`  — advisory only; every ctx_* handler parses
+//     args with Zod (which strips unknown keys server-side), so removing it
+//     changes no validation and no call behavior.
+// Both transforms are behavior-preserving for every other client (Claude Code,
+// Copilot, Cursor, …): `const` and a one-value `enum` are equivalent, and no
+// model sends undeclared properties. Only the wire schema changes — never
+// validation or how any tool is invoked.
+export function sanitizeSchemaForStrictClients(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(sanitizeSchemaForStrictClients);
+  if (node === null || typeof node !== "object") return node;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (key === "additionalProperties") continue;
+    if (key === "const") {
+      out.enum = [value];
+      continue;
+    }
+    out[key] = sanitizeSchemaForStrictClients(value);
+  }
+  return out;
+}
+
+// Wrap the SDK-installed tools/list handler so its generated schemas pass through
+// the sanitizer above. Best-effort by design: if the MCP SDK's internals shift,
+// the original handler is left untouched (no regression — strict clients stay as
+// they were, every other client unaffected). Must run AFTER all registerTool()
+// calls so the SDK's default tools/list handler already exists.
+export function installStrictClientSchemaCompat(target: McpServer = server): void {
+  try {
+    const low = target.server as unknown as {
+      _requestHandlers?: Map<string, (req: unknown, extra: unknown) => Promise<unknown>>;
+    };
+    const original = low._requestHandlers?.get("tools/list");
+    if (typeof original !== "function") return;
+    target.server.setRequestHandler(ListToolsRequestSchema, async (req, extra) => {
+      const result = (await original(req as unknown, extra as unknown)) as
+        | { tools?: Array<{ inputSchema?: unknown }> }
+        | undefined;
+      if (result && Array.isArray(result.tools)) {
+        for (const tool of result.tools) {
+          if (!tool || tool.inputSchema == null) continue;
+          try {
+            tool.inputSchema = sanitizeSchemaForStrictClients(tool.inputSchema);
+          } catch {
+            /* leave this tool's schema unchanged */
+          }
+        }
+      }
+      return result as never;
+    });
+  } catch {
+    /* best-effort — never break tools/list */
+  }
+}
 
 const executor = new PolyglotExecutor({
   runtimes,
@@ -468,10 +527,6 @@ function maybeIndexSessionEvents(store: ContentStore): void {
 // hardcoded configDir detection in tool handlers.
 
 let _detectedAdapter: HookAdapter | null = null;
-
-// Tracks the ctx_insight dashboard child so shutdown can terminate it.
-// See ctx_insight handler + shutdown() in main().
-let _insightChild: ChildProcess | null = null;
 
 /**
  * Resolve the Claude Code config root, honoring `CLAUDE_CONFIG_DIR` (incl.
@@ -843,15 +898,24 @@ function healCacheMidSession(): void {
     if (!existsSync(ipPath)) return;
     const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
     const cacheRoot = resolve(claudeRoot, "plugins", "cache");
+    // Issue #795: canonicalize cacheRoot so the traversal guard works when
+    // ~/.claude is a symlink to another volume.  path.resolve() does not
+    // dereference symlinks, so installPath values stored as physical paths
+    // (e.g. /Volumes/SSD/.../plugins/cache/...) would fail the startsWith
+    // check against a symlink-path cacheRoot (/Users/me/.claude/...).
+    // realpathSync follows the symlink chain to the canonical location.
+    let cacheRootCanon: string;
+    try { cacheRootCanon = realpathSync(cacheRoot); }
+    catch { cacheRootCanon = cacheRoot; }
     // Plugin root: build/ for tsc, plugin root for bundle
-    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
+    const pluginRoot = getPackageRoot();
     for (const [key, entries] of Object.entries((ip.plugins ?? {}) as Record<string, Array<{ installPath?: string }>>)) {
       if (key !== "context-mode@context-mode") continue;
       for (const entry of entries) {
         const rp = entry.installPath;
         if (!rp || existsSync(rp)) continue;
-        // Path traversal guard
-        if (!resolve(rp).startsWith(cacheRoot + sep)) continue;
+        // Path traversal guard (canonical comparison — see #795)
+        if (!resolve(rp).startsWith(cacheRootCanon + sep)) continue;
         // Remove dangling symlink
         try { if (lstatSync(rp).isSymbolicLink()) unlinkSync(rp); } catch {}
         const parent = dirname(rp);
@@ -865,6 +929,9 @@ function healCacheMidSession(): void {
 }
 
 function trackResponse(toolName: string, response: ToolResult): ToolResult {
+  // #854: a response is activity too — refresh the bridge-child idle clock so a
+  // chatty/streaming call keeps its server alive even between inbound frames.
+  noteMcpActivity();
   // Mid-session cache heal — one-shot, first tool call
   healCacheMidSession();
   // Prepend version outdated warning if needed
@@ -911,6 +978,17 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
         bytesReturned: bytes,
       })
     );
+  }
+
+  // Retrieval ("With context-mode") bridge — ctx_search / ctx_fetch_and_index
+  // response bytes are the kept-out content the model paid to access. The
+  // PostToolUse hook never fires for the plugin's OWN MCP tools, so the
+  // hook-side extractMcpToolCall can never see these calls (bytes_retrieved
+  // was 0/124454 in prod). Drop the count into a marker keyed by the session
+  // DB; the next ordinary-tool PostToolUse consumes it and emits a forwardable
+  // bytes_retrieved event. Off the hot path; never throws.
+  if (toolName === "ctx_search" || toolName === "ctx_fetch_and_index") {
+    setImmediate(() => appendRetrievalBytes(getSessionDbPath(), bytes));
   }
 
   return response;
@@ -1125,6 +1203,53 @@ function checkNonShellDenyPolicy(
     }
   } catch {
     // Fail-open
+  }
+  return null;
+}
+
+/**
+ * Issue #852 — project-boundary containment for `ctx_execute_file`.
+ *
+ * The harness sandbox (Claude Code, etc.) cannot inspect MCP input params, so a
+ * user approving a `ctx_execute_file` call cannot see that its `path` escapes
+ * the workspace. This guard refuses a `path` that resolves outside the project
+ * root (absolute escape, `../` traversal, or symlink-out), restoring the
+ * boundary the host believes it is enforcing.
+ *
+ * Escape hatch — NO bespoke opt-out env. A deliberate out-of-project read is
+ * expressed in the SAME host config the user already maintains: a
+ * `permissions.allow` rule like `Read(/var/log/**)`. This reuses the exact
+ * mechanism Claude Code uses to whitelist a path outside its sandbox, so the
+ * grant lives in one place and stays meaningful instead of rotting into a
+ * context-mode-only env flag nobody sets.
+ *
+ * Fail-open on resolver failure (consistent with the other deny checks): if the
+ * project root cannot be resolved, containment evaluates as "inside" and the
+ * path is allowed through rather than spuriously blocking legitimate work.
+ */
+function checkProjectBoundary(
+  filePath: string,
+  toolName: string,
+): ToolResult | null {
+  try {
+    const projectDir = getProjectDir();
+    const allowGlobs = readToolPermissionPatterns("Read", "allow", projectDir);
+    const verdict = evaluateProjectContainment(filePath, projectDir, allowGlobs);
+    if (verdict.allowed) return null;
+    return trackResponse(toolName, {
+      content: [{
+        type: "text" as const,
+        text:
+          `File access blocked: "${filePath}" resolves outside the project root ` +
+          `(${projectDir}). context-mode confines ${toolName} to the workspace so it ` +
+          `cannot be used to bypass the host's sandbox/permission controls (issue #852). ` +
+          `To intentionally process a file outside the project, add a host allow rule, ` +
+          `e.g. "permissions": { "allow": ["Read(${filePath})"] } in your settings.`,
+      }],
+      isError: true,
+    });
+  } catch {
+    // Fail-open — resolver failure must not block legitimate in-project work.
   }
   return null;
 }
@@ -1358,11 +1483,12 @@ export interface BatchRunOptions {
   timeout: number | undefined;
   concurrency: number;
   nodeOptsPrefix: string;
+  cwd?: string;
   onFsBytes?: (bytes: number) => void;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{ stdout: string; timedOut?: boolean }>;
 }
 
 function quotePosixSingle(value: string): string {
@@ -1400,6 +1526,25 @@ function truncateCommandForEcho(command: string): string {
   const cleaned = command.replace(/\s+/g, " ").trim();
   if (cleaned.length <= COMMAND_ECHO_MAX) return cleaned;
   return cleaned.slice(0, COMMAND_ECHO_MAX) + "…";
+}
+
+/**
+ * Default execution timeout (ms) applied ONLY under Antigravity CLI (`agy`).
+ * agy does not enforce an MCP RPC timeout, so a ctx_execute with a runaway or
+ * blocking script hangs forever — the host never kills it and the user must
+ * interrupt. Every other host enforces its own RPC timeout, so we keep the
+ * no-server-timer behavior there (Issue #406 — long builds need an unbounded
+ * run). A caller can still pass an explicit `timeout` to override on any host.
+ */
+export const AGY_DEFAULT_EXEC_TIMEOUT_MS = 120_000;
+export function resolveExecTimeout(timeout: number | undefined): number | undefined {
+  if (timeout !== undefined) return timeout;
+  // Only agy gets a default — every other host enforces its own RPC timeout, so
+  // keep the unbounded behavior there. Detected via the env the agy bundle pins
+  // (CONTEXT_MODE_PLATFORM=antigravity-cli). Tunable via CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS.
+  if (detectPlatform().platform !== "antigravity-cli") return undefined;
+  const override = Number(process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : AGY_DEFAULT_EXEC_TIMEOUT_MS;
 }
 
 /**
@@ -1463,7 +1608,7 @@ export async function runBatchCommands(
   opts: BatchRunOptions,
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
-  const { timeout, concurrency, nodeOptsPrefix, onFsBytes } = opts;
+  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes } = opts;
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
@@ -1489,6 +1634,7 @@ export async function runBatchCommands(
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
+        cwd,
       });
       outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
       if (result.timedOut) {
@@ -1511,6 +1657,7 @@ export async function runBatchCommands(
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
+        cwd,
       });
       // Always route partial output through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
@@ -1546,7 +1693,16 @@ export async function runBatchCommands(
 server.registerTool(
   "ctx_execute",
   {
-    title: "Execute Code",
+    // #852: surface code execution in the host approval prompt's title (the
+    // only server-controlled field the MCP permission UI renders besides args).
+    title: "Run code in a sandbox (executes the supplied code)",
+    // #846: runs arbitrary code in a sandbox with full network access.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description: `Run code in a sandboxed subprocess.${bunNote} Languages: ${langList}.
 
 Think-in-Code — the core philosophy: the bytes your code processes never enter your conversation memory; only what you console.log() does. Reading a 700 KB log directly means 700 KB of your remaining reasoning capacity gets spent on raw bytes. Running code over that same log in this sandbox and printing a 3 KB summary leaves you with 697 KB of capacity for the actual work.
@@ -1577,7 +1733,7 @@ WHEN NOT:
 RETURNS:
   Only what your code prints. Wrap risky calls in try/catch — uncaught errors go to stderr and may leak more than intended. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout; use ctx_search(queries: [...]) to drill into specific sections.
 
-EXAMPLE: ctx_execute(language: "shell", code: "npm test 2>&1 | grep -E '(FAIL|✗|×|Error:|Tests +.*(failed|passed))' | head -60")
+EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('npm test', {encoding:'utf8', stdio:['ignore','pipe','pipe']}); console.log(out.split('\\\\n').filter(l => /(FAIL|✗|×|Error:|Tests +.*(failed|passed))/i.test(l)).slice(0, 60).join('\\\\n'))")
 EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('gh issue list --json number,title --limit 100', {encoding:'utf8'}); const hooks = JSON.parse(out).filter(i => /hook|routing/i.test(i.title)); console.log(\`\${hooks.length} hook-related issues\`)")`,
     inputSchema: z.object({
       language: z
@@ -1615,6 +1771,10 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         .optional()
         .default(false)
         .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE ctx_execute call instead of using background."),
+      cwd: z
+        .string()
+        .optional()
+        .describe("Optional working directory for shell commands. Non-shell languages still execute from their sandbox temp directory."),
       intent: z
         .string()
         .optional()
@@ -1626,7 +1786,7 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         ),
     }),
   },
-  async ({ language, code, timeout, background, intent }) => {
+  async ({ language, code, timeout, background, cwd, intent }) => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1704,7 +1864,8 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
+      const effTimeout = resolveExecTimeout(timeout);
+      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
 
       // Echo the executed source code before stdout so users can audit
       // and tooling can block command patterns (Issues #717 + #736).
@@ -1734,7 +1895,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             content: [
               {
                 type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
+                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${effTimeout}ms — still running)_`,
               },
             ],
           });
@@ -1745,7 +1906,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             content: [
               {
                 type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
+                text: `${echo}${partialOutput}\n\n_(timed out after ${effTimeout}ms — partial output shown above)_`,
               },
             ],
           });
@@ -1754,7 +1915,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           content: [
             {
               type: "text" as const,
-              text: `${echo}Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
+              text: `${echo}Execution timed out after ${effTimeout}ms\n\nstderr:\n${result.stderr}`,
             },
           ],
           isError: true,
@@ -1927,7 +2088,17 @@ function intentSearch(
 server.registerTool(
   "ctx_execute_file",
   {
-    title: "Execute File Processing",
+    // #852: the host's MCP approval prompt renders only the tool name/title +
+    // raw args — the title is the one server-controlled signal, so make it
+    // unambiguously announce code execution + file read for the reviewer.
+    title: "Run code over a file (executes code, reads the given path)",
+    // #846: runs arbitrary code over a file in a sandbox with full network access.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description: `Read a file into a sandboxed FILE_CONTENT variable and run code over it. Only what you console.log() enters your conversation — the file bytes stay in the sandbox.
 
 Think-in-Code applied to file-level analysis: Reading the whole file means every byte enters your conversation memory and costs reasoning capacity for the rest of the session. Running code over it here lets you keep the raw bytes out and only the derived answer in. Same principle as ctx_execute, scoped to one named file via the FILE_CONTENT variable.
@@ -1987,6 +2158,12 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
     }),
   },
   async ({ path, language, code, timeout, intent }) => {
+    // Security (#852): confine the processed file to the project root so
+    // ctx_execute_file cannot be used to escape the host's sandbox/permission
+    // controls. Runs before the deny-glob check — boundary first, then policy.
+    const boundaryDenied = checkProjectBoundary(path, "ctx_execute_file");
+    if (boundaryDenied) return boundaryDenied;
+
     // Security: check file path against Read deny patterns
     const pathDenied = checkFilePathDenyPolicy(path, "ctx_execute_file");
     if (pathDenied) return pathDenied;
@@ -2001,11 +2178,12 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
     }
 
     try {
+      const effTimeout = resolveExecTimeout(timeout);
       const result = await executor.executeFile({
         path,
         language,
         code,
-        timeout,
+        timeout: effTimeout,
       });
 
       // Echo path + executed source code before stdout for audit/debug
@@ -2017,7 +2195,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
           content: [
             {
               type: "text" as const,
-              text: `${echo}Timed out processing ${path} after ${timeout}ms`,
+              text: `${echo}Timed out processing ${path} after ${effTimeout}ms`,
             },
           ],
           isError: true,
@@ -2105,6 +2283,14 @@ server.registerTool(
   "ctx_index",
   {
     title: "Index Content",
+    // #846: writes content into the local FTS5 store (additive, not destructive;
+    // re-indexing the same content adds rows, so not idempotent). No network.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     description: `Store content in a searchable knowledge base (BM25 over FTS5). Splits markdown by headings, keeps code blocks intact, and persists the raw chunks. The full content stays in storage — retrieve any section on-demand via ctx_search; nothing is summarized or truncated.
 
 WHEN:
@@ -2385,11 +2571,35 @@ function readPositiveEnv(name: string, defaultValue: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
 }
 
-let searchCallCount = 0;
-let searchWindowStart = Date.now();
 const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
 const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
 const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
+
+// #769: progressive throttle bucketed PER agent-context, not machine-global.
+// Concurrent subagents share ONE MCP server process; a single global counter
+// summed their independent searches into one budget and hard-blocked
+// legitimate parallel fan-out. The guard keys each actor's window separately
+// so single-actor flood protection is preserved while fan-out is not starved.
+const searchFloodGuard = new FloodGuard({
+  windowMs: SEARCH_WINDOW_MS,
+  softCapAfter: SEARCH_MAX_RESULTS_AFTER,
+  blockAfter: SEARCH_BLOCK_AFTER,
+});
+
+/**
+ * Per-agent flood-guard key. Each concurrent subagent in a Claude Code
+ * Task/Workflow fan-out runs under its own session id (written to SessionDB
+ * via hooks), so currentAttribution().sessionId is the per-agent discriminator
+ * already available MCP-side. Falls back to a single shared bucket when no
+ * identity is resolvable (preserves today's single-threaded behaviour).
+ */
+function searchFloodGuardKey(): string {
+  try {
+    return currentAttribution()?.sessionId ?? "__default__";
+  } catch {
+    return "__default__";
+  }
+}
 
 /**
  * Defensive coercion: parse stringified JSON arrays, AND lift a bare
@@ -2461,6 +2671,13 @@ server.registerTool(
   "ctx_search",
   {
     title: "Search Indexed Content",
+    // #846: read-only query over the local FTS5 store. No mutation, no network.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description: `Search a unified knowledge base with a multi-strategy ranking pipeline. Two parallel matchers run on every query: a Porter-stemming matcher ("caching" finds "cached", "caches", "cach") and a trigram-substring matcher ("useEff" finds "useEffect"). Their ranked lists are merged via Reciprocal Rank Fusion, so a document that ranks well in both surfaces above one that wins only on a single strategy. Multi-term queries get an additional proximity-rerank pass that boosts passages where the query terms appear close together. Typos are corrected via Levenshtein distance and re-searched. Result snippets are window-extracted around the matched terms, not blindly truncated.
 
 The knowledge base is unified: queries reach indexed content you stored (ctx_index, ctx_fetch_and_index, ctx_batch_execute output) AND auto-captured session memory written by hooks (decisions, errors, blockers, plans, user prompts, rejected approaches, tool failures, compaction guides — 26 event categories). File-backed sources carry a content hash and auto-flag staleness when the source file changes.
@@ -2546,20 +2763,17 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         () => getProjectDir(),
       );
 
-      // Progressive throttling: track calls in time window
+      // Progressive throttling: track calls per agent-context window (#769).
       const now = Date.now();
-      if (now - searchWindowStart > SEARCH_WINDOW_MS) {
-        searchCallCount = 0;
-        searchWindowStart = now;
-      }
-      searchCallCount++;
+      const flood = searchFloodGuard.record(searchFloodGuardKey(), now);
+      const searchCallCount = flood.count;
 
-      // After SEARCH_BLOCK_AFTER calls: refuse
-      if (searchCallCount > SEARCH_BLOCK_AFTER) {
+      // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
+      if (flood.blocked) {
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
-            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - searchWindowStart) / 1000)}s. ` +
+            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
               "You're flooding context. STOP making individual search calls. " +
               "Use ctx_batch_execute(commands, queries) for your next research step.",
           }],
@@ -2568,8 +2782,8 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
       }
 
       // Determine per-query result limit based on throttle level
-      const effectiveLimit = searchCallCount > SEARCH_MAX_RESULTS_AFTER
-        ? 1 // after 3 calls: only 1 result per query
+      const effectiveLimit = flood.softCapped
+        ? 1 // after soft cap: only 1 result per query
         : Math.min(limit, 2); // normal: max 2
 
       const MAX_TOTAL = 40 * 1024; // 40KB total cap
@@ -3382,6 +3596,13 @@ server.registerTool(
   "ctx_fetch_and_index",
   {
     title: "Fetch & Index URL(s)",
+    // #846: fetches external URLs (open world) and writes them into the store.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description: `Fetches URL content, converts HTML to markdown (JSON is chunked by key paths, plain text indexed directly), persists it in a searchable knowledge base, and returns a small preview window per source. The raw page bytes never enter your conversation — they live in storage and you retrieve any section on-demand via ctx_search.
 
 Caching: every fetch is cached on disk and reused for repeat calls within the TTL window. The default TTL is 24 hours; override per-call with the \`ttl\` parameter (milliseconds, \`ttl: 0\` bypasses cache like \`force: true\`). Stored content older than 14 days is cleaned up on startup.
@@ -3641,6 +3862,13 @@ server.registerTool(
   "ctx_batch_execute",
   {
     title: "Batch Execute & Search",
+    // #846: runs arbitrary shell commands (with network) and indexes output.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     description: `Run multiple commands in ONE call. Every command's output is auto-indexed into the knowledge base; if you also pass \`queries\`, the matching sections come back in the same round trip so a follow-up search call is not needed.
 
 Concurrency parallelizes the FETCH phase (run-the-commands). The DERIVATION phase — turning raw output into an answer — still belongs in code: add a processing command that consumes the indexed output and prints only the answer, so the raw bytes never enter your conversation (Think-in-Code, same principle as the sandbox tool).
@@ -3712,6 +3940,10 @@ EXAMPLE: ctx_batch_execute(
           ">1 switches to per-command timeouts (no shared budget) and " +
           "individual `(timed out)` blocks instead of cascading skip.",
         ),
+      cwd: z
+        .string()
+        .optional()
+        .describe("Optional working directory for all shell commands in this batch."),
       query_scope: z
         .enum(["batch", "global"])
         .optional()
@@ -3726,7 +3958,7 @@ EXAMPLE: ctx_batch_execute(
         ),
     }),
   },
-  async ({ commands, queries, timeout, concurrency, query_scope }) => {
+  async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -3741,12 +3973,14 @@ EXAMPLE: ctx_batch_execute(
 
       // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
       // Concurrency>1 switches to a worker pool with per-command timeouts.
+      const effTimeout = resolveExecTimeout(timeout);
       const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
         commands,
         {
-          timeout,
+          timeout: effTimeout,
           concurrency,
           nodeOptsPrefix,
+          cwd,
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
         },
         executor,
@@ -3761,7 +3995,7 @@ EXAMPLE: ctx_batch_execute(
           content: [
             {
               type: "text" as const,
-              text: `Batch timed out after ${timeout}ms. No output captured.`,
+              text: `Batch timed out after ${effTimeout}ms. No output captured.`,
             },
           ],
           isError: true,
@@ -3886,6 +4120,13 @@ server.registerTool(
   "ctx_stats",
   {
     title: "Session Statistics",
+    // #846: read-only diagnostics. Was cancelled by Codex when unannotated.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Returns context consumption statistics for the current session. " +
       "Shows total bytes returned to context, breakdown by tool, call counts, " +
@@ -3989,11 +4230,21 @@ server.registerTool(
                     }
                   } catch { /* skip unreadable DB */ }
                 }
-                convReal = projectDirForSid
-                  ? getRealBytesStats({ projectDir: projectDirForSid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath })
-                  : getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath });
+                // Section 1 "Where you are now" = the LIVE conversation window.
+                // Sub-agents + ctx_execute sub-process sessions write to this
+                // SAME worktree DB (same worktreeHash = sha256(cwd)) under their
+                // own session_ids; their retrieval hit their own disposable
+                // windows, not yours. getConversationWindowStats credits the
+                // whole worktree's kept-out bytes while counting only THIS
+                // session's retrieval as "With context-mode", and the
+                // worktreeHash scope keeps the user's OTHER parallel worktrees
+                // out. projectDirForSid is intentionally dropped — it
+                // under-counted (missed empty-project_dir sub-process sessions)
+                // and could not separate sub-agent retrieval from the window's.
+                void projectDirForSid;
+                convReal = getConversationWindowStats({ sessionId: sid, worktreeHash: dbHash, sessionsDir: getSessionDir(), contentDbPath });
               } catch {
-                convReal = getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath });
+                convReal = getConversationWindowStats({ sessionId: sid, worktreeHash: dbHash, sessionsDir: getSessionDir(), contentDbPath });
               }
               const lifeRealBase = getRealBytesStats({ sessionsDir: getSessionDir() });
               // v1.0.134 SLICE C: lifetime tier sums ALL chunks (no
@@ -4072,6 +4323,14 @@ server.registerTool(
   "ctx_doctor",
   {
     title: "Run Diagnostics",
+    // #846: read-only diagnostics (runs an internal self-test, mutates nothing).
+    // Was cancelled by Codex when unannotated.
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Diagnose context-mode installation. Runs all checks server-side and " +
       "returns a plain-text status report with [OK]/[FAIL]/[WARN] prefixes " +
@@ -4087,8 +4346,16 @@ server.registerTool(
     // safe across all MCP renderers — using plain-text status prefixes
     // (`[OK]` / `[FAIL]` / `[WARN]`) instead.
     const lines: string[] = ["context-mode doctor", ""];
-    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
-    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
+    let currentPlatform: PlatformId | undefined;
+    try {
+      currentPlatform = detectPlatform(server.server.getClientVersion() ?? undefined).platform;
+    } catch {
+      currentPlatform = detectPlatform().platform;
+    }
+    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root.
+    // Codex is special: when plugin-manager runtime root differs from the
+    // current package root, diagnose the root Codex will actually execute.
+    const pluginRoot = getRuntimeAwarePackageRoot(currentPlatform);
 
     // Runtimes
     const total = 11;
@@ -4187,6 +4454,14 @@ server.registerTool(
   "ctx_upgrade",
   {
     title: "Upgrade Plugin",
+    // #846: an action tool (returns an upgrade command to run); not read-only,
+    // but non-destructive and idempotent. No direct network from the call.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Upgrade context-mode to the latest version. Returns a shell command to execute. " +
       "You MUST run the returned command using your shell tool (Bash, shell_execute, " +
@@ -4195,12 +4470,39 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
-    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
-    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
+    // Issue #542 — thread MCP clientInfo into the spawned upgrade
+    // process. detectPlatform() runs IN-PROCESS here (no spawn boundary)
+    // so clientInfo from the MCP handshake is the highest-confidence
+    // signal available. We forward the resolved PlatformId as a
+    // --platform flag (cross-shell safe on POSIX, Git Bash, PowerShell,
+    // and cmd.exe — unlike env-var prefixes). If detection fails we
+    // skip the flag and let upgrade()'s own detectPlatform() fall back.
+    let platformFlag = "";
+    let nodeOpts: { platform: string; jsRuntime: string } | undefined =
+      undefined;
+    let platformId: PlatformId | undefined;
+    try {
+      const clientInfo = server.server.getClientVersion();
+      const signal = detectPlatform(clientInfo ?? undefined);
+      platformId = signal.platform;
+      platformFlag = ` --platform ${signal.platform}`;
+      nodeOpts = isInProcessPluginPlatform(signal.platform) && runtimes.javascript
+        ? { platform: signal.platform, jsRuntime: runtimes.javascript }
+        : undefined;
+    } catch {
+      try { platformId = detectPlatform().platform; } catch { /* best effort — fall back to upgrade()'s own detect */ }
+    }
+
+    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root.
+    // Only Codex may replace it with the plugin-manager runtime root; other
+    // adapters can coexist with Codex on the same machine.
+    const pluginRoot = getRuntimeAwarePackageRoot(platformId);
     const bundlePath = resolve(pluginRoot, "cli.bundle.mjs");
     const fallbackPath = resolve(pluginRoot, "build", "cli.js");
 
-    // Clean up insight-cache on upgrade so next ctx_insight does fresh build
+    // Insight pivoted to the hosted dashboard (context-mode.com/insight), so
+    // ctx_insight no longer builds a local cache. On upgrade, sweep the legacy
+    // insight-cache and stop any stale local dashboard left from old versions.
     try {
       const sessDir = getSessionDir();
       const insightCacheDir = join(dirname(sessDir), "insight-cache");
@@ -4213,26 +4515,6 @@ server.registerTool(
         rmSync(insightCacheDir, { recursive: true, force: true });
       }
     } catch { /* best effort — don't block upgrade */ }
-
-    // Issue #542 — thread MCP clientInfo into the spawned upgrade
-    // process. detectPlatform() runs IN-PROCESS here (no spawn boundary)
-    // so clientInfo from the MCP handshake is the highest-confidence
-    // signal available. We forward the resolved PlatformId as a
-    // --platform flag (cross-shell safe on POSIX, Git Bash, PowerShell,
-    // and cmd.exe — unlike env-var prefixes). If detection fails we
-    // skip the flag and let upgrade()'s own detectPlatform() fall back.
-    let platformFlag = "";
-    let nodeOpts: { platform: string; jsRuntime: string } | undefined =
-      undefined;
-    try {
-      const { detectPlatform } = await import("./adapters/detect.js");
-      const clientInfo = server.server.getClientVersion();
-      const signal = detectPlatform(clientInfo ?? undefined);
-      platformFlag = ` --platform ${signal.platform}`;
-      nodeOpts = isInProcessPluginPlatform(signal.platform) && runtimes.javascript
-        ? { platform: signal.platform, jsRuntime: runtimes.javascript }
-        : undefined;
-    } catch { /* best effort — fall back to upgrade()'s own detect */ }
 
 
     let cmd: string;
@@ -4347,6 +4629,14 @@ server.registerTool(
   "ctx_purge",
   {
     title: "Purge Knowledge Base",
+    // #846: permanently deletes indexed content — destructive. Purging an
+    // already-purged scope has no further effect (idempotent). No network.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description: `DESTRUCTIVE: permanently delete indexed content. Cannot be undone. Requires confirm:true and exactly one scope.
 
 WHEN:
@@ -4699,259 +4989,41 @@ export function killProcessOnPort(
   return result;
 }
 
-// ── ctx-insight: analytics dashboard ──────────────────────────────────────────
+// ── ctx-insight: open the hosted Insight dashboard ───────────────────────────
+// Insight pivoted from a locally-built dashboard to the hosted B2B product at
+// context-mode.com/insight (the landing page is the single source of truth).
+// The tool now simply opens that URL in the user default browser via the same
+// cross-platform helper (openBrowserSync) used elsewhere.
+const INSIGHT_URL = "https://context-mode.com/insight";
+
 server.registerTool(
   "ctx_insight",
   {
     title: "Open Insight Dashboard",
+    // #846: opens a hosted dashboard URL in the browser — an external side
+    // effect (open world), not a read-only query; safe to repeat.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     description:
-      "Opens the context-mode Insight dashboard in the browser — a dashboard launcher for session analytics; for natural-language queries over indexed content, use ctx_search. " +
-      "Shows personal analytics: session activity, tool usage, error rate, " +
-      "parallel work patterns, project focus, and actionable insights. " +
-      "First run installs dependencies (~30s). Subsequent runs open instantly. " +
-      "Defaults to port 4747; pass `port` to override. " +
-      "`sessionDir` and `contentDir` override the session/content storage roots " +
-      "(env aliases INSIGHT_SESSION_DIR / INSIGHT_CONTENT_DIR) for diagnosing " +
-      "multi-install setups or pointing at a sibling project's data.",
-    inputSchema: z.object({
-      port: z.coerce.number().int().min(1).max(65535).optional().describe("Port to serve on (default: 4747)"),
-      sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
-      contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
-      insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
-      insightContentDir: z.string().optional().describe("Alias for contentDir / INSIGHT_CONTENT_DIR"),
-    }),
+      "Opens the context-mode Insight dashboard (https://context-mode.com/insight) in your " +
+      "default browser — a dashboard launcher for the hosted analytics layer, not a Q&A engine. " +
+      "Insight surfaces per-engineer productive rate, retry waste, blocker detection, and " +
+      "role-narrowed views for CTO, EM, IC, CISO, FinOps, and DevOps. " +
+      "For natural-language queries over your indexed content, use ctx_search.",
+    inputSchema: z.object({}),
   },
-  async ({ port: userPort, sessionDir, contentDir, insightSessionDir, insightContentDir }) => {
-    const port = userPort || 4747;
-    const explicitSessionDir = sessionDir || insightSessionDir;
-    const explicitContentDir = contentDir || insightContentDir;
-    // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
-    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
-    const insightSource = resolve(pluginRoot, "insight");
-    // Use adapter-aware path by default, but allow MCP callers to pass explicit
-    // Insight data dirs for hosts whose adapter/default detection is unavailable.
-    const sessDir = explicitSessionDir ? resolve(explicitSessionDir) : getSessionDir();
-    const insightContentDirResolved = explicitContentDir ? resolve(explicitContentDir) : join(dirname(sessDir), "content");
-    const cacheDir = join(dirname(sessDir), "insight-cache");
-
-    // Confused-deputy guard on explicit overrides. The spawned insight
-    // server reads every .db file under sessDir and insightContentDir, and
-    // its /api/content DELETE endpoint can rewrite hex-named .db files in
-    // those trees. A prompt-injected caller passing sessionDir="~/.ssh"
-    // or contentDir="~/.gnupg" would otherwise let the dashboard
-    // enumerate (and, for hex-named SQLite files, mutate rows in) those
-    // directories. Contain explicit overrides to the adapter's config
-    // root: broad enough for the documented "multi-install setups or
-    // pointing at a sibling project's data" use case, narrow enough to
-    // block /etc, ~/.ssh, /tmp/<foreign-user>, etc.
-    if (explicitSessionDir || explicitContentDir) {
-      const defaultSessDir = getSessionDir();
-      const containmentRoot = dirname(dirname(defaultSessDir));
-      const containmentRootWithSep = resolve(containmentRoot) + sep;
-      const isContained = (dir: string): boolean =>
-        (resolve(dir) + sep).startsWith(containmentRootWithSep);
-      if (explicitSessionDir && !isContained(sessDir)) {
-        return trackResponse("ctx_insight", {
-          content: [{
-            type: "text" as const,
-            text: `Error: sessionDir must resolve under ${containmentRoot} (got ${sessDir}).`,
-          }],
-        });
-      }
-      if (explicitContentDir && !isContained(insightContentDirResolved)) {
-        return trackResponse("ctx_insight", {
-          content: [{
-            type: "text" as const,
-            text: `Error: contentDir must resolve under ${containmentRoot} (got ${insightContentDirResolved}).`,
-          }],
-        });
-      }
-    }
-
-    // Verify source exists
-    if (!existsSync(join(insightSource, "server.mjs"))) {
-      return trackResponse("ctx_insight", {
-        content: [{ type: "text" as const, text: "Error: Insight source not found in plugin. Try upgrading context-mode." }],
-      });
-    }
-
-    try {
-      const steps: string[] = [];
-      let sourceUpdated = false;
-
-      // Ensure cache dir
-      mkdirSync(cacheDir, { recursive: true });
-
-      // Copy source files if needed (check by comparing server.mjs mtime)
-      const srcMtime = statSync(join(insightSource, "server.mjs")).mtimeMs;
-      const cacheMtime = existsSync(join(cacheDir, "server.mjs"))
-        ? statSync(join(cacheDir, "server.mjs")).mtimeMs : 0;
-
-      if (srcMtime > cacheMtime) {
-        steps.push("Copying source files...");
-        cpSync(insightSource, cacheDir, { recursive: true, force: true });
-        steps.push("Source files copied.");
-        sourceUpdated = true;
-      }
-
-      // Install deps if needed (also reinstall when source updated and package.json may have changed)
-      const hasNodeModules = existsSync(join(cacheDir, "node_modules"));
-      if (!hasNodeModules || sourceUpdated) {
-        steps.push("Installing dependencies (first run, ~30s)...");
-        try {
-          execSync(process.platform === "win32" ? "npm.cmd install --production=false" : "npm install --production=false", {
-            cwd: cacheDir,
-            stdio: "pipe",
-            timeout: 300000,
-          });
-        } catch {
-          // Clean up partial install so next run retries fresh
-          try { rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true }); } catch {}
-          throw new Error("npm install failed — please retry");
-        }
-        // Sentinel check: verify install completed (cold cache can timeout leaving partial node_modules)
-        if (!existsSync(join(cacheDir, "node_modules", "vite")) || !existsSync(join(cacheDir, "node_modules", "better-sqlite3"))) {
-          rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true });
-          throw new Error("npm install incomplete — please retry");
-        }
-        steps.push("Dependencies installed.");
-      }
-
-      // Build
-      steps.push("Building dashboard...");
-      execSync("npx vite build", {
-        cwd: cacheDir,
-        stdio: "pipe",
-        timeout: 60000,
-      });
-      steps.push("Build complete.");
-
-      // Pre-check: is port already in use?
-      let portOccupied = false;
-      try {
-        const { request } = await import("node:http");
-        await new Promise<void>((resolve, reject) => {
-          const req = request(`http://127.0.0.1:${port}/api/overview`, { timeout: 2000 }, (res) => {
-            res.resume();
-            resolve(); // port is responding = already running
-          });
-          req.on("error", () => reject()); // port free
-          req.on("timeout", () => { req.destroy(); reject(); });
-          req.end();
-        });
-        portOccupied = true;
-      } catch {
-        // Port is free, proceed with spawn
-      }
-
-      if (portOccupied && sourceUpdated) {
-        // Source was updated but stale server is running on port — kill it so fresh code runs
-        steps.push("Killing stale dashboard server (source updated)...");
-        const kill = killProcessOnPort(port);
-        if (kill.attemptedPids.length > 0 && kill.killedPids.length === 0) {
-          // Tried to kill, every attempt failed (perms, race, missing binary).
-          // Surface so the agent doesn't loop on the same port forever.
-          return trackResponse("ctx_insight", {
-            content: [{
-              type: "text" as const,
-              text: `Could not free port ${port} (kill failed for ${kill.attemptedPids.join(", ")}: ${kill.errors.join("; ")}). Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
-            }],
-          });
-        }
-        if (kill.errors.length > 0 && kill.attemptedPids.length === 0) {
-          // Couldn't even probe the port (e.g. lsof not installed).
-          return trackResponse("ctx_insight", {
-            content: [{
-              type: "text" as const,
-              text: `Cannot reclaim port ${port}: ${kill.errors.join("; ")}. Stop the process manually or pick another port.`,
-            }],
-          });
-        }
-        await new Promise(r => setTimeout(r, 500)); // Wait for port to free
-        steps.push(`Stale server killed (${kill.killedPids.length} pid${kill.killedPids.length === 1 ? "" : "s"}).`);
-      } else if (portOccupied) {
-        // Source unchanged, server is running fine — just open browser
-        steps.push("Dashboard already running.");
-        const url = `http://localhost:${port}`;
-        const open = openBrowserSync(url);
-        const tail = open.ok
-          ? ""
-          : ` (auto-open failed: ${open.reason}; navigate manually)`;
-        return trackResponse("ctx_insight", {
-          content: [{ type: "text" as const, text: `Dashboard already running at ${url}${tail}` }],
-        });
-      }
-
-      // Kill any previous insight child this MCP spawned (e.g. re-invocation).
-      if (_insightChild && _insightChild.pid && !_insightChild.killed) {
-        try { _insightChild.kill("SIGTERM"); } catch { /* best effort */ }
-      }
-
-      // Start server in background. `detached: true` keeps MCP stdio free, but
-      // we track the handle and kill it in shutdown() so the dashboard does
-      // not orphan when Claude closes. The child also watches INSIGHT_PARENT_PID
-      // as a fallback for SIGKILL/crash paths.
-      const { spawn } = await import("node:child_process");
-      const child = spawn("node", [join(cacheDir, "server.mjs")], {
-        cwd: cacheDir,
-        env: {
-          ...process.env,
-          PORT: String(port),
-          INSIGHT_SESSION_DIR: sessDir,
-          INSIGHT_CONTENT_DIR: insightContentDirResolved,
-          INSIGHT_PARENT_PID: String(process.pid),
-        },
-        detached: true,
-        stdio: "ignore",
-      });
-      child.on("error", () => {}); // prevent unhandled error crash
-      child.unref();
-      _insightChild = child;
-
-      // Wait for server to be ready
-      await new Promise(r => setTimeout(r, 1500));
-
-      // Verify server is actually running
-      try {
-        const { request } = await import("node:http");
-        await new Promise<void>((resolve, reject) => {
-          const req = request(`http://127.0.0.1:${port}/api/overview`, { timeout: 3000 }, (res) => {
-            resolve();
-            res.resume();
-          });
-          req.on("error", reject);
-          req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-          req.end();
-        });
-      } catch {
-        // Server didn't start — likely port in use
-        return trackResponse("ctx_insight", {
-          content: [{
-            type: "text" as const,
-            text: `Port ${port} appears to be in use. Either a previous dashboard is still running, or another service is using this port.\n\nTo fix:\n- Kill the existing process: ${process.platform === "win32" ? `netstat -ano | findstr :${port}` : `lsof -ti:${port} | xargs kill`}\n- Or use a different port: ctx_insight({ port: ${port + 1} })`,
-          }],
-        });
-      }
-
-      // Open browser (cross-platform)
-      const url = `http://localhost:${port}`;
-      const open = openBrowserSync(url);
-      const openTail = open.ok ? "" : ` (auto-open failed: ${open.reason}; navigate manually)`;
-
-      steps.push(`Dashboard running at ${url}${openTail}`);
-
-      return trackResponse("ctx_insight", {
-        content: [{
-          type: "text" as const,
-          text: steps.map(s => `- ${s}`).join("\n") + `\n\nOpen: ${url}\nPID: ${child.pid} · Stop: ${process.platform === "win32" ? `taskkill /PID ${child.pid} /F` : `kill ${child.pid}`}`,
-        }],
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return trackResponse("ctx_insight", {
-        content: [{ type: "text" as const, text: `Insight setup failed: ${msg}` }],
-      });
-    }
+  async () => {
+    const open = openBrowserSync(INSIGHT_URL);
+    const text = open.ok
+      ? `Opening Insight in your browser: ${INSIGHT_URL}`
+      : `Could not auto-open your browser (${open.reason}).\nOpen Insight manually: ${INSIGHT_URL}`;
+    return trackResponse("ctx_insight", {
+      content: [{ type: "text" as const, text }],
+    });
   },
 );
 
@@ -4971,6 +5043,8 @@ async function main() {
   // Hardcoded /tmp on Unix to avoid TMPDIR mismatch (#347).
   const mcpSentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
   const mcpSentinel = join(mcpSentinelDir, `context-mode-mcp-ready-${process.pid}`);
+  // #844: handle to the periodic sentinel refresh timer (started after connect).
+  let sentinelRefresh: ReturnType<typeof setInterval> | undefined;
 
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
@@ -4979,10 +5053,8 @@ async function main() {
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
-    // Stop ctx_insight dashboard so it does not outlive Claude.
-    if (_insightChild && _insightChild.pid && !_insightChild.killed) {
-      try { _insightChild.kill("SIGTERM"); } catch { /* best effort */ }
-    }
+    // #844: stop refreshing the sentinel mtime on shutdown.
+    if (sentinelRefresh) clearInterval(sentinelRefresh);
   };
   const gracefulShutdown = async () => {
     // Final stats flush — bypass throttle so the last 0-500ms of
@@ -5006,8 +5078,25 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // #854: refresh the bridge-child idle clock on each inbound MCP message so an
+  // abandoned bridge child (CONTEXT_MODE_BRIDGE_DEPTH>0) self-terminates instead
+  // of accumulating under a long-lived Pi/omp parent. Best-effort; no stdin touch.
+  attachMcpActivityTap(
+    transport as unknown as { onmessage?: (message: unknown, extra?: unknown) => unknown },
+  );
+
   // Write MCP readiness sentinel (#230)
   try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
+
+  // #844: refresh the sentinel mtime while the server is alive so readiness
+  // probes from a foreign PID namespace (shared /tmp) can trust a recent
+  // sentinel even when process.kill(pid, 0) cannot see this PID. The reader's
+  // freshness window is 90s (hooks/core/mcp-ready.mjs); refresh at 30s (3x).
+  // unref() so this timer never keeps the event loop alive on its own.
+  sentinelRefresh = setInterval(() => {
+    try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
+  }, 30_000);
+  sentinelRefresh.unref();
 
   // Detect platform adapter — stored for platform-aware session paths
   try {
@@ -5147,6 +5236,11 @@ async function startHttpDaemon(port: number): Promise<void> {
   process.on("exit", cleanup);
 }
 
+// Runs after every registerTool() above, so the SDK's default tools/list handler
+// exists and can be wrapped. Makes ctx_* schemas safe for strict (Gemini
+// function-calling) clients like Antigravity CLI (`agy`) / Gemini CLI.
+installStrictClientSchemaCompat();
+
 if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
   const httpFlagIdx = process.argv.indexOf("--http");
   if (httpFlagIdx !== -1) {
@@ -5162,4 +5256,3 @@ if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
       process.exit(1);
     });
   }
-}

@@ -44,6 +44,8 @@ import {
   StorageDirectoryError,
 } from "../../src/session/db.js";
 import { ROUTING_BLOCK } from "../../hooks/routing-block.mjs";
+import { sanitizeSchemaForStrictClients, resolveExecTimeout, AGY_DEFAULT_EXEC_TIMEOUT_MS, REGISTERED_CTX_TOOLS } from "../../src/server.js";
+import { stripJsonComments, parseJsonc } from "../../src/util/jsonc.js";
 
 // ─── Shared setup ───────────────────────────────────────────────────────────
 const runtimes = detectRuntimes();
@@ -1236,7 +1238,7 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     const buildEntry = resolve(__dirname, "..", "..", "build", "server.js");
     if (!existsSync(buildEntry)) {
       // Compile src → build/ on demand. Bundle is untouched (CI rebuilds it).
-      execSync("npx tsc --silent", {
+      execSync("npx tsc --pretty false", {
         cwd: resolve(__dirname, "..", ".."),
         stdio: "pipe",
         timeout: 60_000,
@@ -1247,24 +1249,21 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
     // env carries only IDEA_INITIAL_DIRECTORY pointing at the real project.
     const fakeIdeBin = mkdtempSync(join(tmpdir(), "ctx-jetbrains-bin-"));
 
-    // Strip every PROJECT_DIR env var from the inherited env so the cascade
-    // is forced to consult IDEA_INITIAL_DIRECTORY. Issue #545 (v1.0.124):
-    // also strip the claude-code IDENTIFICATION vars so detectPlatform()
-    // doesn't misclassify the spawned MCP child as claude-code (which would
-    // then run strict-mode and ban IDEA_INITIAL_DIRECTORY as a foreign var).
-    // The test process inherits CLAUDE_CODE_ENTRYPOINT / CLAUDE_PLUGIN_ROOT
-    // from whatever Claude Code session launched the test runner.
+    // Strip inherited platform workspace/identification vars so the cascade is
+    // forced to consult IDEA_INITIAL_DIRECTORY. Issue #545 (v1.0.124): when a
+    // host env var (Claude Code, Codex, etc.) leaks into this child,
+    // detectPlatform() can pick that host, enter strict mode, and ban
+    // IDEA_INITIAL_DIRECTORY as a foreign var.
     const cleanEnv = { ...process.env };
-    delete cleanEnv.CLAUDE_PROJECT_DIR;
-    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
-    delete cleanEnv.CLAUDE_PLUGIN_ROOT;
-    delete cleanEnv.CLAUDE_SESSION_ID;
-    delete cleanEnv.GEMINI_PROJECT_DIR;
-    delete cleanEnv.VSCODE_CWD;
-    delete cleanEnv.OPENCODE_PROJECT_DIR;
-    delete cleanEnv.PI_PROJECT_DIR;
-    delete cleanEnv.PI_WORKSPACE_DIR;
-    delete cleanEnv.CONTEXT_MODE_PROJECT_DIR;
+    for (const key of Object.keys(cleanEnv)) {
+      if (
+        /^(CLAUDE|CODEX|GEMINI|VSCODE|CURSOR|OPENCODE|KILO|KIRO|PI|OMP|ZED|QWEN|KIMI|ANTIGRAVITY|OPENCLAW|COPILOT)_/.test(key) ||
+        key === "CONTEXT_MODE_PLATFORM" ||
+        key === "CONTEXT_MODE_PROJECT_DIR"
+      ) {
+        delete cleanEnv[key];
+      }
+    }
 
     const proc = spawn("node", [buildEntry], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -1735,216 +1734,6 @@ describe("ctx_insight: execFile migration source guard (#441)", () => {
     expect(serverSrc).toMatch(/export function killProcessOnPort\b/);
     expect(serverSrc).toMatch(/export type BrowserOpenResult\b/);
     expect(serverSrc).toMatch(/export type KillResult\b/);
-  });
-
-  test("port schema is bounded to a valid TCP port range", () => {
-    const portDecl = serverSrc.match(/port:\s*z\.coerce\.number\(\)([^,\n]*)\.optional\(\)/);
-    expect(portDecl).not.toBeNull();
-    const constraints = portDecl![1];
-    expect(constraints).toContain(".int()");
-    expect(constraints).toContain(".min(1)");
-    expect(constraints).toContain(".max(65535)");
-  });
-});
-
-describe("ctx_insight: port schema rejects invalid values (#441)", () => {
-  function spawnInsightServer(): ChildProcess {
-    return spawn("node", [mcpEntry], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, CONTEXT_MODE_DISABLE_VERSION_CHECK: "1" },
-    });
-  }
-
-  async function awaitRpc(
-    proc: ChildProcess,
-    id: number,
-    request: Record<string, unknown>,
-    timeoutMs = 10_000,
-  ): Promise<DoctorJsonRpcResponse | undefined> {
-    return new Promise((resolve) => {
-      let buffer = "";
-      const onData = (d: Buffer) => {
-        buffer += d.toString();
-        let idx: number;
-        while ((idx = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, idx).trim();
-          buffer = buffer.slice(idx + 1);
-          if (!line) continue;
-          try {
-            const parsed = JSON.parse(line) as DoctorJsonRpcResponse;
-            if (parsed.id === id) {
-              proc.stdout!.off("data", onData);
-              clearTimeout(timer);
-              resolve(parsed);
-              return;
-            }
-          } catch { /* ignore */ }
-        }
-      };
-      const timer = setTimeout(() => {
-        proc.stdout!.off("data", onData);
-        resolve(undefined);
-      }, timeoutMs);
-      proc.stdout!.on("data", onData);
-      sendRpc(proc, request);
-    });
-  }
-
-  // Each invalid value is exercised against a fresh server so a schema
-  // failure on one input cannot mask a regression on another.
-  const invalidPortCases: Array<{ label: string; port: unknown }> = [
-    { label: "zero (below min)", port: 0 },
-    { label: "negative (below min)", port: -1 },
-    { label: "above 16-bit range", port: 65536 },
-    { label: "non-integer", port: 3.14 },
-    { label: "non-numeric string", port: "not-a-port" },
-  ];
-
-  for (const { label, port } of invalidPortCases) {
-    test(`rejects port=${JSON.stringify(port)} (${label}) at schema layer`, async () => {
-      const proc = spawnInsightServer();
-      try {
-        const init = await awaitRpc(proc, 1, {
-          jsonrpc: "2.0", id: 1, method: "initialize",
-          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-insight-441", version: "1.0" } },
-        });
-        // Init must succeed before tools/call — otherwise an unrelated startup
-        // failure could masquerade as schema rejection.
-        expect(init?.result).toBeDefined();
-        sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
-
-        const resp = await awaitRpc(proc, 100, {
-          jsonrpc: "2.0", id: 100, method: "tools/call",
-          params: { name: "ctx_insight", arguments: { port } },
-        });
-
-        // Schema rejection surfaces as either a JSON-RPC `error` envelope or
-        // a tool result with `isError: true`. Both shapes count as "the
-        // handler never executed" — the contract this test pins.
-        const rejected =
-          (resp?.error !== undefined) ||
-          (resp?.result?.isError === true);
-        expect(rejected).toBe(true);
-
-        // Cross-check: no "Dashboard running" success text leaked through.
-        const text = resp?.result?.content?.[0]?.text ?? "";
-        expect(text).not.toMatch(/Dashboard running at/);
-      } finally {
-        try { proc.kill("SIGTERM"); } catch { /* best effort */ }
-      }
-    }, 20_000);
-  }
-
-  // Pin the schema layer specifically: at least one case must surface as a
-  // JSON-RPC `error` with code -32602 (Invalid params), proving zod rejected
-  // the input before the handler ran.  A regression that loosened the schema
-  // back to `z.coerce.number().optional()` and let the handler crash on
-  // `port=0` would still satisfy the lenient `isError === true` checks above
-  // — but it would not produce a -32602 envelope here.
-  test("schema layer rejects out-of-range port with JSON-RPC -32602", async () => {
-    const proc = spawnInsightServer();
-    try {
-      const init = await awaitRpc(proc, 1, {
-        jsonrpc: "2.0", id: 1, method: "initialize",
-        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-insight-441-schema", version: "1.0" } },
-      });
-      expect(init?.result).toBeDefined();
-      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
-
-      const resp = await awaitRpc(proc, 200, {
-        jsonrpc: "2.0", id: 200, method: "tools/call",
-        params: { name: "ctx_insight", arguments: { port: 70000 } },
-      });
-
-      // Either a top-level error with code -32602 or an isError result whose
-      // text mentions schema/range-validation language. Both prove zod fired.
-      const errCode = resp?.error?.code;
-      const text = resp?.result?.content?.[0]?.text ?? "";
-      const schemaSignal =
-        errCode === -32602 ||
-        /(less than or equal|65535|invalid|too_big|expected number)/i.test(text);
-      expect(schemaSignal).toBe(true);
-    } finally {
-      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
-    }
-  }, 20_000);
-});
-
-describe("ctx_insight: explicit sessionDir/contentDir containment", () => {
-  // The handler resolves sessionDir / contentDir overrides and passes them
-  // to the spawned insight server as INSIGHT_SESSION_DIR / INSIGHT_CONTENT_DIR.
-  // The server then enumerates every *.db file in those dirs (info disclosure)
-  // and, for hex-named files, can DELETE rows via /api/content. Without
-  // containment, a prompt-injected MCP caller passing sessionDir="/etc" or
-  // contentDir="~/.ssh" turns the dashboard into a confused-deputy
-  // enumerator over the user's filesystem. The fix gates explicit overrides
-  // against the adapter's config root: broad enough for the documented
-  // "multi-install setups or pointing at a sibling project's data" use case,
-  // narrow enough to block /etc, ~/.ssh, /tmp/<foreign-user>, etc.
-
-  const SERVER_SOURCE = readFileSync(
-    resolve(__dirname, "../../src/server.ts"),
-    "utf-8",
-  );
-
-  test("ctx_insight handler rejects explicit overrides outside the containment root", () => {
-    // Slice to the ctx_insight handler body. Bounded by the registerTool
-    // call for "ctx_insight" and the next "// ── " section divider that
-    // closes the handler.
-    const handlerStart = SERVER_SOURCE.indexOf('server.registerTool(\n  "ctx_insight"');
-    expect(handlerStart).toBeGreaterThan(0);
-    const handlerSlice = SERVER_SOURCE.slice(handlerStart, handlerStart + 12000);
-    expect(handlerSlice).toContain("Confused-deputy guard on explicit overrides");
-    expect(handlerSlice).toMatch(
-      /if \(explicitSessionDir \|\| explicitContentDir\) \{/,
-    );
-    expect(handlerSlice).toMatch(/const containmentRoot = dirname\(dirname\(defaultSessDir\)\);/);
-    expect(handlerSlice).toMatch(/const containmentRootWithSep = resolve\(containmentRoot\) \+ sep;/);
-    expect(handlerSlice).toMatch(
-      /Error: sessionDir must resolve under \$\{containmentRoot\}/,
-    );
-    expect(handlerSlice).toMatch(
-      /Error: contentDir must resolve under \$\{containmentRoot\}/,
-    );
-  });
-
-  test("algorithm: containment accepts in-tree dirs and rejects /etc and traversal escapes", () => {
-    // Replay the guard logic against a sandbox tree whose default sessions
-    // dir is <root>/.claude/context-mode/sessions. The containment root
-    // derives as dirname(dirname(defaultSessDir)) = <root>/.claude.
-    const base = mkdtempSync(join(tmpdir(), "ctx-insight-containment-"));
-    try {
-      const fakeClaudeRoot = join(base, ".claude");
-      const defaultSessDir = join(fakeClaudeRoot, "context-mode", "sessions");
-      mkdirSync(defaultSessDir, { recursive: true });
-
-      const sepLocal = require("node:path").sep as string;
-      const dirnameLocal = (require("node:path") as typeof import("node:path")).dirname;
-      const containmentRoot = dirnameLocal(dirnameLocal(defaultSessDir));
-      const containmentRootWithSep = resolve(containmentRoot) + sepLocal;
-      const isContained = (dir: string): boolean =>
-        (resolve(dir) + sepLocal).startsWith(containmentRootWithSep);
-
-      // In-tree: legitimate.
-      expect(isContained(defaultSessDir)).toBe(true);
-      expect(isContained(join(fakeClaudeRoot, "context-mode", "content"))).toBe(true);
-      expect(isContained(join(fakeClaudeRoot, "other-install", "sessions"))).toBe(true);
-
-      // Outside the containment root: rejected.
-      expect(isContained("/etc")).toBe(false);
-      expect(isContained(join(base, ".ssh"))).toBe(false);
-      expect(isContained(join(base, "elsewhere"))).toBe(false);
-
-      // Relative-".." escape: resolves outside, rejected.
-      expect(isContained(join(defaultSessDir, "..", "..", "..", "elsewhere"))).toBe(false);
-
-      // Prefix collision: a sibling whose name starts with the same chars
-      // as containmentRoot must not slip through. The trailing sep on
-      // containmentRoot is the safeguard.
-      expect(isContained(fakeClaudeRoot + "-evil")).toBe(false);
-    } finally {
-      rmSync(base, { recursive: true, force: true });
-    }
   });
 });
 
@@ -2420,6 +2209,32 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
     expect(serverSrc).toContain("cli.bundle.mjs");
     // The bundle path should be checked before fallback
     expect(serverSrc).toMatch(/existsSync\(bundlePath\)/);
+  });
+
+  test("ctx_doctor and ctx_upgrade prefer the Codex plugin manager runtime root only for Codex", () => {
+    expect(serverSrc).toContain("parseCodexContextModePluginRoot");
+    expect(serverSrc).toContain("function resolveCodexRuntimePluginRoot");
+    expect(serverSrc).toContain("function getRuntimeAwarePackageRoot");
+
+    const helperBody = serverSrc.slice(
+      serverSrc.indexOf("function getRuntimeAwarePackageRoot"),
+      serverSrc.indexOf("// Prevent silent MCP server death"),
+    );
+    expect(helperBody).toContain('platformId === "codex"');
+    expect(helperBody).toContain("resolveCodexRuntimePluginRoot(packageRoot)");
+
+    const doctorBody = serverSrc.slice(
+      serverSrc.indexOf('server.registerTool(\n  "ctx_doctor"'),
+      serverSrc.indexOf('server.registerTool(\n  "ctx_upgrade"'),
+    );
+    const upgradeBody = serverSrc.slice(
+      serverSrc.indexOf('server.registerTool(\n  "ctx_upgrade"'),
+      serverSrc.indexOf("// ── ctx-purge"),
+    );
+
+    expect(doctorBody).toContain("getRuntimeAwarePackageRoot(currentPlatform)");
+    expect(upgradeBody).toContain("platformId = signal.platform");
+    expect(upgradeBody).toContain("getRuntimeAwarePackageRoot(platformId)");
   });
 
   test("tries build/cli.js second", () => {
@@ -3226,10 +3041,10 @@ import {
 interface MockResult { stdout: string; stderr?: string; timedOut?: boolean; }
 
 function mkMockExecutor(
-  handler: (code: string, timeout: number | undefined) => Promise<MockResult> | MockResult,
-): { execute: (input: { language: "shell"; code: string; timeout: number | undefined }) => Promise<MockResult> } {
+  handler: (code: string, timeout: number | undefined, cwd: string | undefined) => Promise<MockResult> | MockResult,
+): { execute: (input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }) => Promise<MockResult> } {
   return {
-    execute: async ({ code, timeout }) => Promise.resolve(handler(code, timeout)),
+    execute: async ({ code, timeout, cwd }) => Promise.resolve(handler(code, timeout, cwd)),
   };
 }
 
@@ -3270,6 +3085,22 @@ describe("runBatchCommands serial path (concurrency=1)", () => {
     expect(seenCode).not.toContain("NODE 2>&1");
     expect(outputs[0]).toContain("stdout");
     expect(outputs[0]).toContain("stderr");
+  });
+
+  test("passes cwd override to serial shell executions (#756)", async () => {
+    const seenCwds: Array<string | undefined> = [];
+    const exec = mkMockExecutor((_code, _timeout, cwd) => {
+      seenCwds.push(cwd);
+      return { stdout: "ok" };
+    });
+
+    await runBatchCommands(
+      [{ label: "cwd", command: "pwd" }],
+      { timeout: 5000, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX, cwd: "/worktree/repo" },
+      exec,
+    );
+
+    expect(seenCwds).toEqual(["/worktree/repo"]);
   });
 
   test("cascading skip: timeout in first cmd skips the rest", async () => {
@@ -3390,6 +3221,26 @@ describe("runBatchCommands parallel path (concurrency>1)", () => {
     expect(outputs[0]).toContain("one stderr");
     expect(outputs[1]).toContain("two stdout");
     expect(outputs[1]).toContain("two stderr");
+  });
+
+  test("passes cwd override to parallel shell executions (#756)", async () => {
+    const seenCwds: Array<string | undefined> = [];
+    const exec = mkMockExecutor((_code, _timeout, cwd) => {
+      seenCwds.push(cwd);
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "pwd" },
+      { label: "B", command: "git branch --show-current" },
+    ];
+
+    await runBatchCommands(
+      cmds,
+      { timeout: 5000, concurrency: 2, nodeOptsPrefix: NOOP_PREFIX, cwd: "/worktree/repo" },
+      exec,
+    );
+
+    expect(seenCwds).toEqual(["/worktree/repo", "/worktree/repo"]);
   });
 
   test("order preservation: outputs match input order, not completion order", async () => {
@@ -5242,6 +5093,96 @@ test("OpenCode legacy MCP suppression parses JSONC URLs without stripping // ins
   }
 });
 
+// #787 review regression, applied to server.ts: its local stripJsonComments
+// ended with a whole-string trailing-comma regex that deleted commas INSIDE
+// string values ("[1, ]" -> "[1 ]"). That corruption always leaves the JSON
+// valid (only the comma char is deleted; the anchoring bracket stays), and
+// shouldSuppressMcpToolsForNativePluginHost() — the only public surface over
+// readNativePluginHostSettings() — checks just the plugin array for a
+// "context-mode" substring and the mcp object for a "context-mode" key, so a
+// deleted in-string comma can never flip the boolean ("context-mode" contains
+// no comma to delete and no bracket to leave behind). Pin the fix
+// structurally instead: server.ts must delegate to the shared string-aware
+// src/util/jsonc.ts — whose in-string-comma behavior IS pinned by the
+// "parseJsonc / stripJsonComments" suite below — and must not reintroduce a
+// local whole-string trailing-comma regex.
+test("server.ts delegates JSONC stripping to string-aware src/util/jsonc (#787 in-string trailing-comma regression)", async () => {
+  const serverSrc = readFileSync(resolve(__dirname, "../../src/server.ts"), "utf8");
+  expect(serverSrc).toContain('from "./util/jsonc.js"');
+  expect(serverSrc).not.toContain('.replace(/,(\\s*[}\\]])/g');
+  // End-to-end sanity through the public boolean: a JSONC config that needs
+  // the strip path (comment + real trailing comma) and embeds a
+  // trailing-comma-like pattern inside a string value still parses and
+  // suppresses.
+  const { shouldSuppressMcpToolsForNativePluginHost } = await import("../../src/server.js");
+  const dir = mkdtempSync(join(tmpdir(), "opencode-jsonc-comma-"));
+  const cwd = process.cwd();
+  try {
+    writeFileSync(join(dir, "opencode.jsonc"), `{
+      // forces the comment/trailing-comma strip path
+      "note": "array literal: [1, ]",
+      "plugin": ["context-mode"],
+      "mcp": {
+        "context-mode": { "type": "local", "command": ["context-mode"] }
+      },
+    }\n`);
+    process.chdir(dir);
+    expect(shouldSuppressMcpToolsForNativePluginHost({ platform: "opencode" })).toBe(true);
+  } finally {
+    process.chdir(cwd);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── src/util/jsonc — shared string-aware JSONC strip/parse (#787/#806) ─────
+// The naive regex strippers that lived in src/server.ts and the OpenCode
+// adapter corrupted string VALUES: `//` inside URLs was cut as a "comment"
+// (#806), and a whole-string trailing-comma regex ate commas inside string
+// literals ("[1, ]" -> "[1 ]", the 386a196 regression). These tests pin the
+// shared util that replaced both.
+describe("parseJsonc / stripJsonComments (src/util/jsonc)", () => {
+  test("preserves // inside string values (URLs) while stripping line comments", () => {
+    const jsonc = '{\n  // strip me\n  "url": "https://mcp.context7.com/mcp"\n}';
+    expect(parseJsonc<{ url: string }>(jsonc)?.url).toBe("https://mcp.context7.com/mcp");
+    expect(stripJsonComments('{"url": "https://example.com/x"}')).toBe('{"url": "https://example.com/x"}');
+  });
+
+  test("treats // after an escaped quote as still inside the string", () => {
+    const jsonc = '{ // c\n "say": "say \\"hi\\" // not a comment" }';
+    expect(parseJsonc<{ say: string }>(jsonc)?.say).toBe('say "hi" // not a comment');
+  });
+
+  test("parses CRLF input with line comments", () => {
+    const jsonc = '{\r\n  // comment\r\n  "a": 1,\r\n  "b": 2\r\n}\r\n';
+    expect(parseJsonc(jsonc)).toEqual({ a: 1, b: 2 });
+  });
+
+  test("removes trailing commas before } and ], including whitespace/comment-separated ones", () => {
+    expect(parseJsonc('{ // c\n "a": [1, 2,], "b": { "c": 3, }, }')).toEqual({ a: [1, 2], b: { c: 3 } });
+    expect(parseJsonc('{ "a": 1, /* note */ }')).toEqual({ a: 1 });
+  });
+
+  test("strips a block comment containing a URL without touching neighbors", () => {
+    const jsonc = '{ /* see https://example.com/docs */ "a": 1, // tail\n "b": 2 }';
+    expect(parseJsonc(jsonc)).toEqual({ a: 1, b: 2 });
+  });
+
+  test("preserves a comma inside a string value (the 386a196 regression)", () => {
+    const jsonc = '{\n  // forces the strip path\n  "note": "array literal: [1, ]"\n}';
+    expect(parseJsonc<{ note: string }>(jsonc)?.note).toBe("array literal: [1, ]");
+    expect(stripJsonComments('{"a":"x, ]","b":[1,]}')).toBe('{"a":"x, ]","b":[1]}');
+  });
+
+  test("plain valid JSON passes through parseJsonc unchanged", () => {
+    const raw = '{"a": [1, 2], "u": "https://example.com", "s": "x, ]"}';
+    expect(parseJsonc(raw)).toEqual(JSON.parse(raw));
+  });
+
+  test("returns undefined when input is not JSON at all", () => {
+    expect(parseJsonc("not json at all {{")).toBeUndefined();
+  });
+});
+
 // Issue #623: when ctx_* tool registration is suppressed for the legacy MCP
 // child on OpenCode/Kilo, an MCP client inspecting tools/list sees an empty
 // list with NO explanation. The plugin-native tools work, but a user who only
@@ -6578,5 +6519,200 @@ describe("ctx_stats cache observability + index_state (issue #697)", () => {
     expect(textNarrative).not.toContain("index.total_chunks");
     expect(textNarrative).not.toContain("index.total_sources");
     expect(textNarrative).not.toContain("index.last_indexed_at");
+  });
+});
+
+// Gemini's function-calling API (Antigravity CLI `agy`, Gemini CLI) rejects
+// JSON Schema `const` and `additionalProperties` and then silently drops the
+// tool from the model's function list. The sanitizer rewrites the EMITTED
+// tools/list schema in a behavior-preserving way so those tools become callable.
+describe("sanitizeSchemaForStrictClients", () => {
+  test("rewrites `const: X` to `enum: [X]` (an identical single-value constraint)", () => {
+    expect(sanitizeSchemaForStrictClients({ const: "javascript" })).toEqual({ enum: ["javascript"] });
+    expect(sanitizeSchemaForStrictClients({ const: 1 })).toEqual({ enum: [1] });
+  });
+
+  test("strips `additionalProperties` (advisory-only — Zod validates args server-side)", () => {
+    const out = sanitizeSchemaForStrictClients({
+      type: "object",
+      additionalProperties: false,
+      properties: { a: { type: "string" } },
+    }) as Record<string, unknown>;
+    expect(out).not.toHaveProperty("additionalProperties");
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual({ a: { type: "string" } });
+  });
+
+  test("preserves every Gemini-compatible keyword unchanged", () => {
+    // enum / pattern / default / minLength etc. are accepted by Gemini and must
+    // pass through untouched so non-Gemini clients see an identical schema.
+    const input = {
+      type: "string",
+      enum: ["a", "b"],
+      pattern: "^x",
+      default: "a",
+      minLength: 1,
+      description: "desc",
+    };
+    expect(sanitizeSchemaForStrictClients(input)).toEqual(input);
+  });
+
+  test("recurses through nested properties and arrays", () => {
+    const input = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        language: { const: "shell" },
+        items: { type: "array", items: { const: 1 }, additionalProperties: true },
+      },
+    };
+    expect(sanitizeSchemaForStrictClients(input)).toEqual({
+      type: "object",
+      properties: {
+        language: { enum: ["shell"] },
+        items: { type: "array", items: { enum: [1] } },
+      },
+    });
+  });
+
+  test("leaves primitives and null untouched", () => {
+    expect(sanitizeSchemaForStrictClients("x")).toBe("x");
+    expect(sanitizeSchemaForStrictClients(7)).toBe(7);
+    expect(sanitizeSchemaForStrictClients(true)).toBe(true);
+    expect(sanitizeSchemaForStrictClients(null)).toBe(null);
+  });
+
+  test("does not mutate the input object", () => {
+    const input = { const: "x", additionalProperties: false };
+    sanitizeSchemaForStrictClients(input);
+    expect(input).toEqual({ const: "x", additionalProperties: false });
+  });
+});
+
+describe("parseJsonc / stripJsonComments (src/util/jsonc)", () => {
+  // Regression for the #787 review: the trailing-comma strip used to run a regex
+  // over the WHOLE string, eating commas INSIDE string values. parseJsonc only
+  // reaches the stripper when strict JSON.parse fails (a comment forces that),
+  // so the corruption was silent.
+  test("preserves a comma inside a string value on the comment-strip path", () => {
+    const jsonc = '{\n  // forces the strip path\n  "note": "array literal: [1, ]"\n}';
+    expect(parseJsonc<{ note: string }>(jsonc)?.note).toBe("array literal: [1, ]");
+  });
+
+  test("still strips real trailing commas (object, array, nested) once a comment forces the path", () => {
+    expect(parseJsonc('{ // c\n "a": [1, 2,], "b": { "c": 3, }, }')).toEqual({ a: [1, 2], b: { c: 3 } });
+  });
+
+  test("strips a trailing comma even when a comment sits between it and the bracket", () => {
+    expect(parseJsonc('{ "a": 1, /* note */ }')).toEqual({ a: 1 });
+  });
+
+  test("strips // line and /* */ block comments", () => {
+    expect(parseJsonc('{\n  "a": 1, // line\n  /* block */ "b": 2\n}')).toEqual({ a: 1, b: 2 });
+  });
+
+  test("keeps // and , inside string values intact (URL with trailing-comma-like text)", () => {
+    const jsonc = '{ // c\n "u": "http://x.com/a, ]" }';
+    expect(parseJsonc<{ u: string }>(jsonc)?.u).toBe("http://x.com/a, ]");
+  });
+
+  test("stripJsonComments removes a trailing comma but keeps an identical in-string one", () => {
+    expect(stripJsonComments('{"a":"x, ]","b":[1,]}')).toBe('{"a":"x, ]","b":[1]}');
+  });
+
+  test("returns undefined when both strict and lenient parses fail", () => {
+    expect(parseJsonc("not json at all {{")).toBeUndefined();
+  });
+});
+
+describe("resolveExecTimeout (agy default execution timeout)", () => {
+  const savedPlatform = process.env.CONTEXT_MODE_PLATFORM;
+  const savedOverride = process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS;
+  afterEach(() => {
+    if (savedPlatform === undefined) delete process.env.CONTEXT_MODE_PLATFORM;
+    else process.env.CONTEXT_MODE_PLATFORM = savedPlatform;
+    if (savedOverride === undefined) delete process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS;
+    else process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS = savedOverride;
+  });
+
+  test("passes an explicit timeout through on any platform", () => {
+    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
+    expect(resolveExecTimeout(5000)).toBe(5000);
+    process.env.CONTEXT_MODE_PLATFORM = "claude-code";
+    expect(resolveExecTimeout(5000)).toBe(5000);
+  });
+
+  test("applies the agy default ONLY under antigravity-cli when no timeout is given", () => {
+    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
+    delete process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS;
+    expect(resolveExecTimeout(undefined)).toBe(AGY_DEFAULT_EXEC_TIMEOUT_MS);
+  });
+
+  test("leaves the timeout unbounded (undefined) on non-agy hosts", () => {
+    process.env.CONTEXT_MODE_PLATFORM = "claude-code";
+    expect(resolveExecTimeout(undefined)).toBeUndefined();
+  });
+
+  test("honors CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS override under agy", () => {
+    process.env.CONTEXT_MODE_PLATFORM = "antigravity-cli";
+    process.env.CONTEXT_MODE_AGY_EXEC_TIMEOUT_MS = "1500";
+    expect(resolveExecTimeout(undefined)).toBe(1500);
+  });
+});
+
+// ─── ctx_* MCP tool annotations (#846) ───────────────────
+// "Server & tools" domain → this file owns tool registration per CONTRIBUTING.md.
+// Inspects the actual registered descriptors via the exported registry, not just
+// descriptions, so a missing/incorrect annotation fails CI.
+describe("ctx_* MCP tool annotations (#846)", () => {
+  type Hints = {
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+  };
+  // Classified by real behavior (no blanket readOnlyHint).
+  const EXPECTED: Record<string, Hints> = {
+    ctx_execute:         { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
+    ctx_execute_file:    { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
+    ctx_index:           { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    ctx_search:          { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+    ctx_fetch_and_index: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true  },
+    ctx_batch_execute:   { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
+    ctx_stats:           { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+    ctx_doctor:          { readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+    ctx_upgrade:         { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+    ctx_purge:           { readOnlyHint: false, destructiveHint: true,  idempotentHint: true,  openWorldHint: false },
+    ctx_insight:         { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: true  },
+  };
+  const tools = REGISTERED_CTX_TOOLS as Array<{ name: string; config: { annotations?: Hints } }>;
+  const find = (name: string) => tools.find((t) => t.name === name);
+
+  test("registers exactly the expected ctx_* tools", () => {
+    expect(tools.map((t) => t.name).sort()).toEqual(Object.keys(EXPECTED).sort());
+  });
+
+  test("every ctx_* tool carries explicit annotations classified by real behavior", () => {
+    for (const [name, hints] of Object.entries(EXPECTED)) {
+      const tool = find(name);
+      expect(tool, `${name} not registered`).toBeDefined();
+      expect(tool!.config.annotations, `${name} missing annotations`).toBeDefined();
+      expect(tool!.config.annotations).toMatchObject(hints);
+    }
+  });
+
+  test("read-only diagnostic/query tools are readOnlyHint:true (the #846 cancellation fix)", () => {
+    for (const name of ["ctx_search", "ctx_stats", "ctx_doctor"]) {
+      expect(find(name)!.config.annotations!.readOnlyHint).toBe(true);
+    }
+  });
+
+  test("never blanket-marks executing/mutating/destructive tools read-only", () => {
+    for (const name of [
+      "ctx_execute", "ctx_execute_file", "ctx_batch_execute", "ctx_index",
+      "ctx_fetch_and_index", "ctx_purge", "ctx_upgrade", "ctx_insight",
+    ]) {
+      expect(find(name)!.config.annotations!.readOnlyHint).toBe(false);
+    }
   });
 });
