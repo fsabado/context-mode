@@ -898,6 +898,79 @@ describe("Timeout Handling", () => {
   });
 });
 
+describe("Cancellation", () => {
+  test("abort before spawn — process never starts, resolves immediately", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const r = await executor.execute({
+      language: "javascript",
+      code: "console.log('should not run')",
+      signal: ac.signal,
+    });
+    assert.equal(r.cancelled, true);
+    assert.equal(r.stdout.trim(), "");
+  });
+
+  test("abort mid-run — process killed, partial output preserved", async () => {
+    const ac = new AbortController();
+    const promise = executor.execute({
+      language: "javascript",
+      code: `console.log("started"); while(true) {}`,
+      signal: ac.signal,
+    });
+    // Give the process a moment to actually start and flush "started".
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const r = await promise;
+    assert.equal(r.cancelled, true);
+    assert.equal(r.stdout.trim(), "started");
+  }, 10_000);
+
+  test("abort mid-run leaves no orphaned process", async () => {
+    const ac = new AbortController();
+    const promise = executor.execute({
+      language: "javascript",
+      code: `process.stdout.write(String(process.pid)); while(true) {}`,
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const r = await promise;
+    const pid = parseInt(r.stdout.trim(), 10);
+    assert.ok(pid > 0, `Expected valid PID in stdout, got: "${r.stdout}"`);
+    await new Promise((r) => setTimeout(r, 200));
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch { /* ESRCH = good */ }
+    assert.equal(alive, false, `Process ${pid} should be dead after abort kill`);
+  }, 10_000);
+
+  test("abort after natural completion is a no-op", async () => {
+    const ac = new AbortController();
+    const r = await executor.execute({
+      language: "javascript",
+      code: "console.log('done')",
+      signal: ac.signal,
+    });
+    ac.abort(); // fires after the promise already settled — must not throw
+    assert.equal(r.cancelled, undefined);
+    assert.equal(r.timedOut, false);
+    assert.equal(r.stdout.trim(), "done");
+  });
+
+  test("Shell: abort mid-run kills sleep", async () => {
+    const ac = new AbortController();
+    const promise = executor.execute({
+      language: "shell",
+      code: "sleep 5",
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const r = await promise;
+    assert.equal(r.cancelled, true);
+  }, 10_000);
+});
+
 describe("Output Truncation", () => {
   test("stdout is returned in full without truncation", async () => {
     const small = new PolyglotExecutor({ runtimes });
