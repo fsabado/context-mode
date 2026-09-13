@@ -62,6 +62,8 @@ export interface ExecResult {
   timedOut: boolean;
   /** Process was detached and continues running in the background. */
   backgrounded?: boolean;
+  /** Process was killed because the caller (MCP client) cancelled the request. */
+  cancelled?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────
