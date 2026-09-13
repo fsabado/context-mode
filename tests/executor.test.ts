@@ -1395,6 +1395,26 @@ puts "Users via file_path: #{data['users'].length}"
   });
 });
 
+describe("execute_file cancellation", () => {
+  test("abort mid-run kills the process, executeFile reports cancelled", async () => {
+    const tmpFile = join(tmpdir(), `cm-cancel-test-${Date.now()}.txt`);
+    writeFileSync(tmpFile, "hello");
+    const ac = new AbortController();
+    const promise = executor.executeFile({
+      path: tmpFile,
+      language: "javascript",
+      code: `console.log("started"); while(true) {}`,
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort();
+    const r = await promise;
+    assert.equal(r.cancelled, true);
+    assert.equal(r.stdout.trim(), "started");
+    rmSync(tmpFile, { force: true });
+  }, 10_000);
+});
+
 describe("Environment Passthrough", () => {
   test("SSH_AUTH_SOCK is passed through to subprocess when set", async () => {
     const original = process.env.SSH_AUTH_SOCK;
