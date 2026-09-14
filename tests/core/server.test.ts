@@ -6580,3 +6580,70 @@ describe("ctx_stats cache observability + index_state (issue #697)", () => {
     expect(textNarrative).not.toContain("index.last_indexed_at");
   });
 });
+
+describe("ctx_execute cancellation (in-memory MCP)", () => {
+  test("cancelling an in-flight ctx_execute call over the real MCP wire kills the subprocess", async () => {
+    // Per MCP spec + SDK behavior: the CLIENT that sends notifications/cancelled
+    // proactively rejects its own pending call locally (AbortError) — it does not
+    // wait for a graceful response body from the server. So this test can't assert
+    // on the resolved response text; instead it proves the whole wire path (client
+    // abort → cancel notification → SDK server-side extra.signal → our handler →
+    // executor kill) by having the sandboxed process write its own PID to a temp
+    // file, then checking that PID is dead after cancellation.
+    // Isolate storage from the real (potentially large, network-mounted)
+    // session directory — this test only cares about MCP-wire cancellation,
+    // not session/analytics bookkeeping.
+    process.env[STORAGE_ENV_KEY] = mkdtempSync(join(tmpdir(), "cm-cancel-test-"));
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { server } = await import("../../src/server.js");
+
+    // The module's own top-level `main()` already connected `server` to a
+    // real StdioServerTransport at import time (this test file has earlier
+    // static imports of server.js that don't set
+    // CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS, so that guard doesn't help here).
+    // Detach it so we can attach our own in-memory transport instead.
+    await server.server.close().catch(() => {});
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.server.connect(serverTransport);
+    const client = new Client({ name: "cancel-probe", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+
+    const pidFile = join(tmpdir(), `cm-wire-cancel-${Date.now()}.pid`);
+    const ac = new AbortController();
+    const callPromise = client.callTool(
+      {
+        name: "ctx_execute",
+        arguments: {
+          language: "javascript",
+          code: `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); while(true) {}`,
+        },
+      },
+      undefined,
+      { signal: ac.signal },
+    );
+    callPromise.catch(() => {}); // expected to reject on abort — handled below
+
+    // Wait for the pid file to appear (process has started).
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(pidFile)).toBe(true);
+
+    ac.abort();
+    await expect(callPromise).rejects.toThrow();
+
+    const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 300));
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch { /* ESRCH = dead, good */ }
+    expect(alive).toBe(false);
+
+    rmSync(pidFile, { force: true });
+    await client.close();
+    await server.server.close().catch(() => {});
+  }, 15_000);
+});

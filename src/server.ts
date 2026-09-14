@@ -289,7 +289,7 @@ const originalRegisterTool = server.registerTool.bind(server);
   const [name, config, handler] = args as [
     string,
     Record<string, unknown>,
-    (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
+    (toolArgs: Record<string, unknown>, extra?: unknown) => Promise<unknown> | unknown,
   ];
   if (suppressMcpToolsForNativePluginHost) {
     emitSuppressionDiagnostic();
@@ -303,11 +303,15 @@ const originalRegisterTool = server.registerTool.bind(server);
 
 function wrapToolHandler(
   name: string,
-  handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-): (toolArgs: Record<string, unknown>) => Promise<unknown> {
-  return async (toolArgs: Record<string, unknown>) => {
+  handler: (toolArgs: Record<string, unknown>, extra?: unknown) => Promise<unknown> | unknown,
+): (toolArgs: Record<string, unknown>, extra?: unknown) => Promise<unknown> {
+  // extra (RequestHandlerExtra, carries .signal for MCP cancellation) must be
+  // forwarded positionally — dropping it here silently breaks cancellation
+  // for every registered tool, since this wrapper sits between the SDK's
+  // dispatch and every tool's real handler.
+  return async (toolArgs: Record<string, unknown>, extra?: unknown) => {
     try {
-      return await handler(toolArgs);
+      return await handler(toolArgs, extra);
     } catch (err) {
       const result = storageErrorResult(err);
       if (result) {
@@ -1626,7 +1630,7 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         ),
     }),
   },
-  async ({ language, code, timeout, background, intent }) => {
+  async ({ language, code, timeout, background, intent }, extra) => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1704,7 +1708,7 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout, background, signal: extra.signal });
 
       // Echo the executed source code before stdout so users can audit
       // and tooling can block command patterns (Issues #717 + #736).
@@ -1724,6 +1728,20 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       if (fsMatch) {
         sessionStats.bytesSandboxed += parseInt(fsMatch[1]);
         result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
+      }
+
+      if (result.cancelled) {
+        const cancelledPartial = result.stdout?.trim();
+        return trackResponse("ctx_execute", {
+          content: [
+            {
+              type: "text" as const,
+              text: cancelledPartial
+                ? `${echo}${cancelledPartial}\n\n_(cancelled by user — partial output shown above)_`
+                : `${echo}Execution cancelled by user`,
+            },
+          ],
+        });
       }
 
       if (result.timedOut) {
