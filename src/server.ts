@@ -1351,6 +1351,7 @@ export interface BatchCommand { label: string; command: string; }
 export interface BatchRunResult {
   outputs: string[];
   timedOut: boolean;
+  cancelled: boolean;
 }
 
 export interface BatchRunOptions {
@@ -1363,10 +1364,12 @@ export interface BatchRunOptions {
   concurrency: number;
   nodeOptsPrefix: string;
   onFsBytes?: (bytes: number) => void;
+  /** Abort signal tied to the MCP request's lifetime — kills every in-flight command. */
+  signal?: AbortSignal;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; signal?: AbortSignal }): Promise<{ stdout: string; timedOut?: boolean; cancelled?: boolean }>;
 }
 
 function quotePosixSingle(value: string): string {
@@ -1467,7 +1470,7 @@ export async function runBatchCommands(
   opts: BatchRunOptions,
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
-  const { timeout, concurrency, nodeOptsPrefix, onFsBytes } = opts;
+  const { timeout, concurrency, nodeOptsPrefix, onFsBytes, signal } = opts;
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
@@ -1476,6 +1479,7 @@ export async function runBatchCommands(
     const outputs: string[] = [];
     const startTime = Date.now();
     let timedOut = false;
+    let cancelled = false;
     for (let i = 0; i < commands.length; i++) {
       const cmd = commands[i];
       let perCmdTimeout: number | undefined;
@@ -1493,8 +1497,16 @@ export async function runBatchCommands(
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
+        signal,
       });
       outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
+      if (result.cancelled) {
+        cancelled = true;
+        for (let j = i + 1; j < commands.length; j++) {
+          outputs.push(`# ${commands[j].label}\n\n(skipped — cancelled by user)\n`);
+        }
+        break;
+      }
       if (result.timedOut) {
         timedOut = true;
         for (let j = i + 1; j < commands.length; j++) {
@@ -1503,44 +1515,52 @@ export async function runBatchCommands(
         break;
       }
     }
-    return { outputs, timedOut };
+    return { outputs, timedOut, cancelled };
   }
 
   // Parallel path — delegated to the shared runPool primitive.
   // Each job returns { output, timedOut }; runPool handles in-flight cap,
   // throw isolation (Promise.allSettled semantics), and order preservation.
-  const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
+  // `signal` is the SAME AbortSignal object passed to every job — one
+  // client-side cancel kills every concurrently-running command at once,
+  // not just the first one.
+  const jobs: PoolJob<{ output: string; timedOut: boolean; cancelled: boolean }>[] = commands.map((cmd) => ({
     run: async () => {
       const result = await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
+        signal,
       });
       // Always route partial output through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
       const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes);
-      const output = result.timedOut
+      const output = result.cancelled
+        ? formatted.replace(/\n$/, "") + `\n(cancelled by user)\n`
+        : result.timedOut
         ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout ?? "?"}ms)\n`
         : formatted;
-      return { output, timedOut: !!result.timedOut };
+      return { output, timedOut: !!result.timedOut, cancelled: !!result.cancelled };
     },
   }));
 
   const { settled } = await runPool(jobs, { concurrency });
   const outputs: string[] = new Array(commands.length);
   let timedOut = false;
+  let cancelled = false;
   for (let i = 0; i < settled.length; i++) {
     const r = settled[i];
     if (r.status === "fulfilled") {
       outputs[i] = r.value.output;
       if (r.value.timedOut) timedOut = true;
+      if (r.value.cancelled) cancelled = true;
     } else {
       // Isolated executor throw (spawn EAGAIN, ENOMEM, EMFILE, …) — siblings keep running.
       const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
       outputs[i] = `# ${commands[i].label}\n\n(executor error: ${message})\n`;
     }
   }
-  return { outputs, timedOut };
+  return { outputs, timedOut, cancelled };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -3759,7 +3779,7 @@ EXAMPLE: ctx_batch_execute(
         ),
     }),
   },
-  async ({ commands, queries, timeout, concurrency, query_scope }) => {
+  async ({ commands, queries, timeout, concurrency, query_scope }, extra) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -3774,16 +3794,28 @@ EXAMPLE: ctx_batch_execute(
 
       // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
       // Concurrency>1 switches to a worker pool with per-command timeouts.
-      const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
+      const { outputs: perCommandOutputs, timedOut, cancelled } = await runBatchCommands(
         commands,
         {
           timeout,
           concurrency,
           nodeOptsPrefix,
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
+          signal: extra.signal,
         },
         executor,
       );
+
+      if (cancelled && perCommandOutputs.length === 0) {
+        return trackResponse("ctx_batch_execute", {
+          content: [
+            {
+              type: "text" as const,
+              text: `Batch cancelled by user. No output captured.`,
+            },
+          ],
+        });
+      }
 
       const stdout = perCommandOutputs.join("\n");
       const totalBytes = Buffer.byteLength(stdout);

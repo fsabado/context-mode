@@ -6703,3 +6703,72 @@ describe("ctx_execute_file cancellation (in-memory MCP)", () => {
     await server.server.close().catch(() => {});
   }, 15_000);
 });
+
+describe("ctx_batch_execute cancellation (in-memory MCP)", () => {
+  test("cancelling kills all in-flight parallel commands", async () => {
+    process.env[STORAGE_ENV_KEY] = mkdtempSync(join(tmpdir(), "cm-cancel-batch-test-"));
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { server } = await import("../../src/server.js");
+
+    await server.server.close().catch(() => {});
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.server.connect(serverTransport);
+    const client = new Client({ name: "cancel-batch-probe", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+
+    const pidFileA = join(tmpdir(), `cm-wire-cancel-batch-a-${Date.now()}.pid`);
+    const pidFileB = join(tmpdir(), `cm-wire-cancel-batch-b-${Date.now()}.pid`);
+    const ac = new AbortController();
+    const callPromise = client.callTool(
+      {
+        name: "ctx_batch_execute",
+        arguments: {
+          commands: [
+            { label: "a", command: `echo started-a > ${pidFileA}; sleep 5` },
+            { label: "b", command: `echo started-b > ${pidFileB}; sleep 5` },
+          ],
+          queries: ["placeholder"],
+          concurrency: 2,
+        },
+      },
+      undefined,
+      { signal: ac.signal },
+    );
+    callPromise.catch(() => {});
+
+    for (let i = 0; i < 50 && !(existsSync(pidFileA) && existsSync(pidFileB)); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(pidFileA)).toBe(true);
+    expect(existsSync(pidFileB)).toBe(true);
+
+    // Capture the sleep PIDs via pgrep on the marker commands before abort.
+    const findSleepPids = (marker: string): number[] => {
+      try {
+        const out = execSync(`pgrep -f "${marker}"`, { encoding: "utf-8" });
+        return out.trim().split("\n").filter(Boolean).map((s) => parseInt(s, 10));
+      } catch {
+        return [];
+      }
+    };
+    const pidsBefore = [...findSleepPids(pidFileA), ...findSleepPids(pidFileB)];
+    expect(pidsBefore.length).toBeGreaterThan(0);
+
+    ac.abort();
+    await expect(callPromise).rejects.toThrow();
+
+    await new Promise((r) => setTimeout(r, 500));
+    const stillAlive = pidsBefore.filter((pid) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    });
+    expect(stillAlive).toEqual([]);
+
+    rmSync(pidFileA, { force: true });
+    rmSync(pidFileB, { force: true });
+    await client.close();
+    await server.server.close().catch(() => {});
+  }, 15_000);
+});
