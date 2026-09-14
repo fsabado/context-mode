@@ -1728,7 +1728,7 @@ ${code}
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
       }
-      const result = await executor.execute({ language, code: instrumentedCode, timeout, background, signal: extra.signal });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout, background, signal: extra?.signal });
 
       // Echo the executed source code before stdout so users can audit
       // and tooling can block command patterns (Issues #717 + #736).
@@ -2044,7 +2044,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         language,
         code,
         timeout,
-        signal: extra.signal,
+        signal: extra?.signal,
       });
 
       // Echo path + executed source code before stdout for audit/debug
@@ -3801,7 +3801,7 @@ EXAMPLE: ctx_batch_execute(
           concurrency,
           nodeOptsPrefix,
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
-          signal: extra.signal,
+          signal: extra?.signal,
         },
         executor,
       );
