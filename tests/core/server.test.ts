@@ -6716,3 +6716,202 @@ describe("ctx_* MCP tool annotations (#846)", () => {
     }
   });
 });
+
+describe("ctx_execute cancellation (in-memory MCP)", () => {
+  test("cancelling an in-flight ctx_execute call over the real MCP wire kills the subprocess", async () => {
+    // Per MCP spec + SDK behavior: the CLIENT that sends notifications/cancelled
+    // proactively rejects its own pending call locally (AbortError) — it does not
+    // wait for a graceful response body from the server. So this test can't assert
+    // on the resolved response text; instead it proves the whole wire path (client
+    // abort → cancel notification → SDK server-side extra.signal → our handler →
+    // executor kill) by having the sandboxed process write its own PID to a temp
+    // file, then checking that PID is dead after cancellation.
+    // Isolate storage from the real (potentially large, network-mounted)
+    // session directory — this test only cares about MCP-wire cancellation,
+    // not session/analytics bookkeeping.
+    process.env[STORAGE_ENV_KEY] = mkdtempSync(join(tmpdir(), "cm-cancel-test-"));
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { server } = await import("../../src/server.js");
+
+    // The module's own top-level `main()` already connected `server` to a
+    // real StdioServerTransport at import time (this test file has earlier
+    // static imports of server.js that don't set
+    // CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS, so that guard doesn't help here).
+    // Detach it so we can attach our own in-memory transport instead.
+    await server.server.close().catch(() => {});
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.server.connect(serverTransport);
+    const client = new Client({ name: "cancel-probe", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+
+    const pidFile = join(tmpdir(), `cm-wire-cancel-${Date.now()}.pid`);
+    const ac = new AbortController();
+    const callPromise = client.callTool(
+      {
+        name: "ctx_execute",
+        arguments: {
+          language: "javascript",
+          code: `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); while(true) {}`,
+        },
+      },
+      undefined,
+      { signal: ac.signal },
+    );
+    callPromise.catch(() => {}); // expected to reject on abort — handled below
+
+    // Wait for the pid file to appear (process has started).
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(pidFile)).toBe(true);
+
+    ac.abort();
+    await expect(callPromise).rejects.toThrow();
+
+    const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 300));
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch { /* ESRCH = dead, good */ }
+    expect(alive).toBe(false);
+
+    rmSync(pidFile, { force: true });
+    await client.close();
+    await server.server.close().catch(() => {});
+  }, 15_000);
+});
+
+describe("ctx_execute_file cancellation (in-memory MCP)", () => {
+  test("cancelling an in-flight ctx_execute_file call over the real MCP wire kills the subprocess", async () => {
+    process.env[STORAGE_ENV_KEY] = mkdtempSync(join(tmpdir(), "cm-cancel-file-test-"));
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { server, getProjectDir } = await import("../../src/server.js");
+
+    await server.server.close().catch(() => {});
+
+    // Issue #852 confines ctx_execute_file's `path` param to the project root
+    // (checkProjectBoundary) — os.tmpdir() lives outside it. Use getProjectDir()
+    // itself rather than process.cwd(): on this EFS-backed setup, ~/studio is a
+    // symlink to /mnt/custom-file-systems/..., and process.cwd() vs getProjectDir()
+    // can disagree on which string names "the project root" even though both
+    // resolve to the same physical directory — checkProjectBoundary compares
+    // strings, so only getProjectDir()'s own answer is guaranteed to pass it.
+    const tmpFile = join(getProjectDir(), `cm-cancel-src-${Date.now()}.txt`);
+    writeFileSync(tmpFile, "hello");
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.server.connect(serverTransport);
+    const client = new Client({ name: "cancel-file-probe", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+
+    const pidFile = join(tmpdir(), `cm-wire-cancel-file-${Date.now()}.pid`);
+    const ac = new AbortController();
+    const callPromise = client.callTool(
+      {
+        name: "ctx_execute_file",
+        arguments: {
+          path: tmpFile,
+          language: "javascript",
+          code: `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); while(true) {}`,
+        },
+      },
+      undefined,
+      { signal: ac.signal },
+    );
+    callPromise.catch(() => {});
+
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(pidFile)).toBe(true);
+
+    ac.abort();
+    await expect(callPromise).rejects.toThrow();
+
+    const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 300));
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch { /* ESRCH = dead, good */ }
+    expect(alive).toBe(false);
+
+    rmSync(pidFile, { force: true });
+    rmSync(tmpFile, { force: true });
+    await client.close();
+    await server.server.close().catch(() => {});
+  }, 15_000);
+});
+
+describe("ctx_batch_execute cancellation (in-memory MCP)", () => {
+  test("cancelling kills all in-flight parallel commands", async () => {
+    process.env[STORAGE_ENV_KEY] = mkdtempSync(join(tmpdir(), "cm-cancel-batch-test-"));
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { server } = await import("../../src/server.js");
+
+    await server.server.close().catch(() => {});
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.server.connect(serverTransport);
+    const client = new Client({ name: "cancel-batch-probe", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+
+    const pidFileA = join(tmpdir(), `cm-wire-cancel-batch-a-${Date.now()}.pid`);
+    const pidFileB = join(tmpdir(), `cm-wire-cancel-batch-b-${Date.now()}.pid`);
+    const ac = new AbortController();
+    const callPromise = client.callTool(
+      {
+        name: "ctx_batch_execute",
+        arguments: {
+          commands: [
+            { label: "a", command: `echo started-a > ${pidFileA}; sleep 5` },
+            { label: "b", command: `echo started-b > ${pidFileB}; sleep 5` },
+          ],
+          queries: ["placeholder"],
+          concurrency: 2,
+        },
+      },
+      undefined,
+      { signal: ac.signal },
+    );
+    callPromise.catch(() => {});
+
+    for (let i = 0; i < 50 && !(existsSync(pidFileA) && existsSync(pidFileB)); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(pidFileA)).toBe(true);
+    expect(existsSync(pidFileB)).toBe(true);
+
+    // Capture the sleep PIDs via pgrep on the marker commands before abort.
+    const findSleepPids = (marker: string): number[] => {
+      try {
+        const out = execSync(`pgrep -f "${marker}"`, { encoding: "utf-8" });
+        return out.trim().split("\n").filter(Boolean).map((s) => parseInt(s, 10));
+      } catch {
+        return [];
+      }
+    };
+    const pidsBefore = [...findSleepPids(pidFileA), ...findSleepPids(pidFileB)];
+    expect(pidsBefore.length).toBeGreaterThan(0);
+
+    ac.abort();
+    await expect(callPromise).rejects.toThrow();
+
+    await new Promise((r) => setTimeout(r, 500));
+    const stillAlive = pidsBefore.filter((pid) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    });
+    expect(stillAlive).toEqual([]);
+
+    rmSync(pidFileA, { force: true });
+    rmSync(pidFileB, { force: true });
+    await client.close();
+    await server.server.close().catch(() => {});
+  }, 15_000);
+});

@@ -1,4 +1,4 @@
-import { spawn, execSync, execFileSync } from "node:child_process";
+import { spawn, execSync, execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -222,6 +222,12 @@ interface ExecuteOptions {
    * a non-project cwd (e.g. $HOME).
    */
   cwd?: string;
+  /**
+   * Abort signal tied to the MCP request's lifetime. When the client
+   * cancels the request (`notifications/cancelled`), the SDK fires this,
+   * and the running subprocess is killed the same way a timeout kills it.
+   */
+  signal?: AbortSignal;
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -280,7 +286,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, background = false, cwd: cwdOverride } = opts;
+    const { language, code, timeout, background = false, cwd: cwdOverride, signal } = opts;
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -289,7 +295,7 @@ export class PolyglotExecutor {
 
       // Rust: compile then run
       if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout);
+        return await this.#compileAndRun(filePath, tmpDir, timeout, signal);
       }
 
       // Every language runs in the project directory so git, relative paths,
@@ -304,7 +310,7 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -319,14 +325,14 @@ export class PolyglotExecutor {
   }
 
   async executeFile(opts: ExecuteFileOptions): Promise<ExecResult> {
-    const { path: filePath, language, code, timeout } = opts;
+    const { path: filePath, language, code, timeout, signal } = opts;
     const absolutePath = resolve(this.#projectRoot, filePath);
     const wrappedCode = this.#wrapWithFileContent(
       absolutePath,
       language,
       code,
     );
-    return this.execute({ language, code: wrappedCode, timeout });
+    return this.execute({ language, code: wrappedCode, timeout, signal });
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
@@ -378,9 +384,14 @@ export class PolyglotExecutor {
     srcPath: string,
     cwd: string,
     timeout: number | undefined,
+    signal?: AbortSignal,
   ): Promise<ExecResult> {
     const binSuffix = isWin ? ".exe" : "";
     const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
+
+    if (signal?.aborted) {
+      return { stdout: "", stderr: "", exitCode: 1, timedOut: false, cancelled: true };
+    }
 
     // Compile — cap rustc invocation at 60s when caller didn't bound the
     // overall timeout (a hung compile shouldn't run forever even if the
@@ -391,8 +402,15 @@ export class PolyglotExecutor {
         timeout: timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
-      });
+        // ponytail: @types/node 22.19 doesn't declare `signal` on
+        // ExecFileSyncOptions even though Node itself has supported it
+        // since 15.14 — cast to bypass the stale ambient type only here.
+        signal,
+      } as ExecFileSyncOptionsWithStringEncoding);
     } catch (err: unknown) {
+      if (signal?.aborted) {
+        return { stdout: "", stderr: "", exitCode: 1, timedOut: false, cancelled: true };
+      }
       const message = err instanceof Error ? (err as any).stderr || err.message : String(err);
       return {
         stdout: "",
@@ -403,7 +421,7 @@ export class PolyglotExecutor {
     }
 
     // Run
-    return this.#spawn([binPath], cwd, cwd, timeout);
+    return this.#spawn([binPath], cwd, cwd, timeout, false, signal);
   }
 
   async #spawn(
@@ -412,7 +430,13 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number | undefined,
     background = false,
+    signal?: AbortSignal,
   ): Promise<ExecResult> {
+    // Abort fired before we even got here — don't spawn at all.
+    if (signal?.aborted) {
+      return { stdout: "", stderr: "", exitCode: 1, timedOut: false, cancelled: true };
+    }
+
     return new Promise((res) => {
       // Only .cmd/.bat shims need shell on Windows; real executables don't.
       // Using shell: true globally causes process-tree kill issues with MSYS2/Git Bash.
@@ -466,6 +490,7 @@ export class PolyglotExecutor {
       }
 
       let timedOut = false;
+      let cancelled = false;
       let resolved = false;
       // Issue #406 — if the caller didn't pass a timeout we don't fire one.
       // Timeout policy belongs to the MCP host/client (Claude Code, VSCode,
@@ -507,6 +532,12 @@ export class PolyglotExecutor {
         }
       }, timeout);
 
+      const onAbort = () => {
+        cancelled = true;
+        killTree(proc);
+      };
+      signal?.addEventListener("abort", onAbort);
+
       // Stream-level byte cap: kill the process once combined stdout+stderr
       // exceeds hardCapBytes. Without this, a command like `yes` or
       // `cat /dev/urandom | base64` can accumulate gigabytes in memory
@@ -538,6 +569,7 @@ export class PolyglotExecutor {
 
       proc.on("close", (exitCode) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         if (resolved) return; // Already resolved by background timeout
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
@@ -552,19 +584,22 @@ export class PolyglotExecutor {
         res({
           stdout,
           stderr,
-          exitCode: timedOut ? 1 : (exitCode ?? 1),
+          exitCode: timedOut || cancelled ? 1 : (exitCode ?? 1),
           timedOut,
+          ...(cancelled ? { cancelled: true } : {}),
         });
       });
 
       proc.on("error", (err) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         if (resolved) return; // Already resolved by background timeout
         res({
           stdout: "",
           stderr: err.message,
           exitCode: 1,
           timedOut: false,
+          ...(cancelled ? { cancelled: true } : {}),
         });
       });
     });

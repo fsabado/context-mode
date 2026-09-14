@@ -280,7 +280,7 @@ const originalRegisterTool = server.registerTool.bind(server);
   const [name, config, handler] = args as [
     string,
     Record<string, unknown>,
-    (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
+    (toolArgs: Record<string, unknown>, extra?: unknown) => Promise<unknown> | unknown,
   ];
   if (suppressMcpToolsForNativePluginHost) {
     emitSuppressionDiagnostic();
@@ -294,15 +294,19 @@ const originalRegisterTool = server.registerTool.bind(server);
 
 function wrapToolHandler(
   name: string,
-  handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-): (toolArgs: Record<string, unknown>) => Promise<unknown> {
-  return async (toolArgs: Record<string, unknown>) => {
+  handler: (toolArgs: Record<string, unknown>, extra?: unknown) => Promise<unknown> | unknown,
+): (toolArgs: Record<string, unknown>, extra?: unknown) => Promise<unknown> {
+  // extra (RequestHandlerExtra, carries .signal for MCP cancellation) must be
+  // forwarded positionally — dropping it here silently breaks cancellation
+  // for every registered tool, since this wrapper sits between the SDK's
+  // dispatch and every tool's real handler.
+  return async (toolArgs: Record<string, unknown>, extra?: unknown) => {
     // #854: mark a tool call in-flight so the bridge-child idle reaper never
     // shuts the server down mid-execution during a long ctx_execute/batch that
     // emits no further inbound messages. Symmetric end in finally (success+error).
     noteRequestStart();
     try {
-      return await handler(toolArgs);
+      return await handler(toolArgs, extra);
     } catch (err) {
       const result = storageErrorResult(err);
       if (result) {
@@ -1472,6 +1476,7 @@ export interface BatchCommand { label: string; command: string; }
 export interface BatchRunResult {
   outputs: string[];
   timedOut: boolean;
+  cancelled: boolean;
 }
 
 export interface BatchRunOptions {
@@ -1485,10 +1490,12 @@ export interface BatchRunOptions {
   nodeOptsPrefix: string;
   cwd?: string;
   onFsBytes?: (bytes: number) => void;
+  /** Abort signal tied to the MCP request's lifetime — kills every in-flight command. */
+  signal?: AbortSignal;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{ stdout: string; timedOut?: boolean }>;
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string; signal?: AbortSignal }): Promise<{ stdout: string; timedOut?: boolean; cancelled?: boolean }>;
 }
 
 function quotePosixSingle(value: string): string {
@@ -1608,7 +1615,7 @@ export async function runBatchCommands(
   opts: BatchRunOptions,
   executor: BatchExecutor,
 ): Promise<BatchRunResult> {
-  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes } = opts;
+  const { timeout, concurrency, nodeOptsPrefix, cwd, onFsBytes, signal } = opts;
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
@@ -1617,6 +1624,7 @@ export async function runBatchCommands(
     const outputs: string[] = [];
     const startTime = Date.now();
     let timedOut = false;
+    let cancelled = false;
     for (let i = 0; i < commands.length; i++) {
       const cmd = commands[i];
       let perCmdTimeout: number | undefined;
@@ -1635,8 +1643,16 @@ export async function runBatchCommands(
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
         cwd,
+        signal,
       });
       outputs.push(formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes));
+      if (result.cancelled) {
+        cancelled = true;
+        for (let j = i + 1; j < commands.length; j++) {
+          outputs.push(`# ${commands[j].label}\n\n(skipped — cancelled by user)\n`);
+        }
+        break;
+      }
       if (result.timedOut) {
         timedOut = true;
         for (let j = i + 1; j < commands.length; j++) {
@@ -1645,45 +1661,53 @@ export async function runBatchCommands(
         break;
       }
     }
-    return { outputs, timedOut };
+    return { outputs, timedOut, cancelled };
   }
 
   // Parallel path — delegated to the shared runPool primitive.
   // Each job returns { output, timedOut }; runPool handles in-flight cap,
   // throw isolation (Promise.allSettled semantics), and order preservation.
-  const jobs: PoolJob<{ output: string; timedOut: boolean }>[] = commands.map((cmd) => ({
+  // `signal` is the SAME AbortSignal object passed to every job — one
+  // client-side cancel kills every concurrently-running command at once,
+  // not just the first one.
+  const jobs: PoolJob<{ output: string; timedOut: boolean; cancelled: boolean }>[] = commands.map((cmd) => ({
     run: async () => {
       const result = await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
         cwd,
+        signal,
       });
       // Always route partial output through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
       const formatted = formatCommandOutput(cmd.label, cmd.command, combineExecOutput(result), onFsBytes);
-      const output = result.timedOut
+      const output = result.cancelled
+        ? formatted.replace(/\n$/, "") + `\n(cancelled by user)\n`
+        : result.timedOut
         ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout ?? "?"}ms)\n`
         : formatted;
-      return { output, timedOut: !!result.timedOut };
+      return { output, timedOut: !!result.timedOut, cancelled: !!result.cancelled };
     },
   }));
 
   const { settled } = await runPool(jobs, { concurrency });
   const outputs: string[] = new Array(commands.length);
   let timedOut = false;
+  let cancelled = false;
   for (let i = 0; i < settled.length; i++) {
     const r = settled[i];
     if (r.status === "fulfilled") {
       outputs[i] = r.value.output;
       if (r.value.timedOut) timedOut = true;
+      if (r.value.cancelled) cancelled = true;
     } else {
       // Isolated executor throw (spawn EAGAIN, ENOMEM, EMFILE, …) — siblings keep running.
       const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
       outputs[i] = `# ${commands[i].label}\n\n(executor error: ${message})\n`;
     }
   }
-  return { outputs, timedOut };
+  return { outputs, timedOut, cancelled };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1786,7 +1810,7 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         ),
     }),
   },
-  async ({ language, code, timeout, background, cwd, intent }) => {
+  async ({ language, code, timeout, background, cwd, intent }, extra) => {
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1865,7 +1889,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 })(typeof require!=='undefined'?require:null);`;
       }
       const effTimeout = resolveExecTimeout(timeout);
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd, signal: extra?.signal });
 
       // Echo the executed source code before stdout so users can audit
       // and tooling can block command patterns (Issues #717 + #736).
@@ -1885,6 +1909,20 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       if (fsMatch) {
         sessionStats.bytesSandboxed += parseInt(fsMatch[1]);
         result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
+      }
+
+      if (result.cancelled) {
+        const cancelledPartial = result.stdout?.trim();
+        return trackResponse("ctx_execute", {
+          content: [
+            {
+              type: "text" as const,
+              text: cancelledPartial
+                ? `${echo}${cancelledPartial}\n\n_(cancelled by user — partial output shown above)_`
+                : `${echo}Execution cancelled by user`,
+            },
+          ],
+        });
       }
 
       if (result.timedOut) {
@@ -2157,7 +2195,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         ),
     }),
   },
-  async ({ path, language, code, timeout, intent }) => {
+  async ({ path, language, code, timeout, intent }, extra) => {
     // Security (#852): confine the processed file to the project root so
     // ctx_execute_file cannot be used to escape the host's sandbox/permission
     // controls. Runs before the deny-glob check — boundary first, then policy.
@@ -2184,11 +2222,26 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         language,
         code,
         timeout: effTimeout,
+        signal: extra?.signal,
       });
 
       // Echo path + executed source code before stdout for audit/debug
       // (Issues #717 + #736).
       const echo = buildExecuteEcho(language, code, path);
+
+      if (result.cancelled) {
+        const cancelledPartial = result.stdout?.trim();
+        return trackResponse("ctx_execute_file", {
+          content: [
+            {
+              type: "text" as const,
+              text: cancelledPartial
+                ? `${echo}${cancelledPartial}\n\n_(cancelled by user — partial output shown above)_`
+                : `${echo}Execution cancelled by user`,
+            },
+          ],
+        });
+      }
 
       if (result.timedOut) {
         return trackResponse("ctx_execute_file", {
@@ -3958,7 +4011,7 @@ EXAMPLE: ctx_batch_execute(
         ),
     }),
   },
-  async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
+  async ({ commands, queries, timeout, concurrency, cwd, query_scope }, extra) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -3974,7 +4027,7 @@ EXAMPLE: ctx_batch_execute(
       // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
       // Concurrency>1 switches to a worker pool with per-command timeouts.
       const effTimeout = resolveExecTimeout(timeout);
-      const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
+      const { outputs: perCommandOutputs, timedOut, cancelled } = await runBatchCommands(
         commands,
         {
           timeout: effTimeout,
@@ -3982,9 +4035,21 @@ EXAMPLE: ctx_batch_execute(
           nodeOptsPrefix,
           cwd,
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
+          signal: extra?.signal,
         },
         executor,
       );
+
+      if (cancelled && perCommandOutputs.length === 0) {
+        return trackResponse("ctx_batch_execute", {
+          content: [
+            {
+              type: "text" as const,
+              text: `Batch cancelled by user. No output captured.`,
+            },
+          ],
+        });
+      }
 
       const stdout = perCommandOutputs.join("\n");
       const totalBytes = Buffer.byteLength(stdout);
@@ -5256,3 +5321,4 @@ if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
       process.exit(1);
     });
   }
+}
