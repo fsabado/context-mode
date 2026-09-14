@@ -6647,3 +6647,59 @@ describe("ctx_execute cancellation (in-memory MCP)", () => {
     await server.server.close().catch(() => {});
   }, 15_000);
 });
+
+describe("ctx_execute_file cancellation (in-memory MCP)", () => {
+  test("cancelling an in-flight ctx_execute_file call over the real MCP wire kills the subprocess", async () => {
+    process.env[STORAGE_ENV_KEY] = mkdtempSync(join(tmpdir(), "cm-cancel-file-test-"));
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { server } = await import("../../src/server.js");
+
+    await server.server.close().catch(() => {});
+
+    const tmpFile = join(tmpdir(), `cm-cancel-src-${Date.now()}.txt`);
+    writeFileSync(tmpFile, "hello");
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.server.connect(serverTransport);
+    const client = new Client({ name: "cancel-file-probe", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+
+    const pidFile = join(tmpdir(), `cm-wire-cancel-file-${Date.now()}.pid`);
+    const ac = new AbortController();
+    const callPromise = client.callTool(
+      {
+        name: "ctx_execute_file",
+        arguments: {
+          path: tmpFile,
+          language: "javascript",
+          code: `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); while(true) {}`,
+        },
+      },
+      undefined,
+      { signal: ac.signal },
+    );
+    callPromise.catch(() => {});
+
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(pidFile)).toBe(true);
+
+    ac.abort();
+    await expect(callPromise).rejects.toThrow();
+
+    const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 300));
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch { /* ESRCH = dead, good */ }
+    expect(alive).toBe(false);
+
+    rmSync(pidFile, { force: true });
+    rmSync(tmpFile, { force: true });
+    await client.close();
+    await server.server.close().catch(() => {});
+  }, 15_000);
+});

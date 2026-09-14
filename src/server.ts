@@ -2004,7 +2004,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         ),
     }),
   },
-  async ({ path, language, code, timeout, intent }) => {
+  async ({ path, language, code, timeout, intent }, extra) => {
     // Security: check file path against Read deny patterns
     const pathDenied = checkFilePathDenyPolicy(path, "ctx_execute_file");
     if (pathDenied) return pathDenied;
@@ -2024,11 +2024,26 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         language,
         code,
         timeout,
+        signal: extra.signal,
       });
 
       // Echo path + executed source code before stdout for audit/debug
       // (Issues #717 + #736).
       const echo = buildExecuteEcho(language, code, path);
+
+      if (result.cancelled) {
+        const cancelledPartial = result.stdout?.trim();
+        return trackResponse("ctx_execute_file", {
+          content: [
+            {
+              type: "text" as const,
+              text: cancelledPartial
+                ? `${echo}${cancelledPartial}\n\n_(cancelled by user — partial output shown above)_`
+                : `${echo}Execution cancelled by user`,
+            },
+          ],
+        });
+      }
 
       if (result.timedOut) {
         return trackResponse("ctx_execute_file", {
