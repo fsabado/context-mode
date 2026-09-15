@@ -273,6 +273,26 @@ browser_network_requests(includeStatic: false, filename: "/tmp/network.md")
 >
 > Data flow: **Playwright → file → server-side read → context**. Never: **Playwright → context → ctx_index(content) → context again**.
 
+## CLI Fallback (MCP Down)
+
+If the MCP bridge is unreachable (tools missing, bridge crashed) or you're in a Bash-only
+surface with no MCP tools at all, `context-mode` is also a standalone CLI — it talks to the
+same daemon directly over HTTP and does not depend on the MCP connection:
+
+| MCP tool | CLI equivalent |
+|----------|----------------|
+| `ctx_execute` | `context-mode execute --language <lang> --code '...'` (or `--code-file <path>`, or pipe via stdin) |
+| `ctx_execute_file` | `context-mode execute-file <path> --language <lang> --code '...'` |
+| `ctx_fetch_and_index` | `context-mode fetch <url> [--source label]` |
+| `ctx_stats` | `context-mode session-stats` |
+| `ctx_purge` | `context-mode purge --confirm --scope <session\|project> [--session-id <id>]` |
+| `ctx_index` / `ctx_search` | `context-mode index <path>` / `context-mode search <query...>` |
+
+Use the CLI as the first fallback before reaching for raw `curl`/`cat`/inline HTTP — it keeps
+the sandboxing, caching, and FTS5 indexing behavior even when MCP itself is down.
+`ctx_batch_execute` has no CLI form: its value is cutting round-trips inside a single MCP
+session; from a shell just run the commands directly.
+
 ## Subagent Usage
 
 Subagents automatically receive context-mode tool routing via a PreToolUse hook. You do NOT need to manually add tool names to subagent prompts — the hook injects them. Just write natural task descriptions.

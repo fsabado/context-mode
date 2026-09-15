@@ -499,7 +499,9 @@ export default function piExtension(pi: any): void {
           block: true,
           reason:
             "Use context-mode MCP tools (execute, fetch_and_index) instead of inline HTTP clients. " +
-            "Raw fetch/requests/http output floods the context window.",
+            "Raw fetch/requests/http output floods the context window. " +
+            "If MCP tools are unavailable, use the CLI instead: " +
+            "`context-mode execute --language <lang> --code '...'` or `context-mode fetch <url>`.",
         };
       }
 
@@ -517,7 +519,9 @@ export default function piExtension(pi: any): void {
             reason:
               "Use context-mode MCP tools (execute, fetch_and_index) instead of inline HTTP clients. " +
               "Raw curl/wget output floods the context window. " +
-              "For an MCP-down escape hatch, use silent + file output: " +
+              "Preferred MCP-down escape hatch: `context-mode fetch <url> --source <label>` " +
+              "(runs standalone, no MCP bridge required). " +
+              "Last resort, if the context-mode CLI itself is unavailable: silent + file output — " +
               "`curl -s -o /tmp/x.json URL` or `wget -q -O /tmp/x.json URL`.",
           };
         }
