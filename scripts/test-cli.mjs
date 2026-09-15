@@ -190,6 +190,39 @@ check("index <dir>   (legacy positional, directory)", () => {
   return { ok: r.status === 0, detail: r.stdout.trim() || r.stderr };
 });
 
+// ── execute/execute-file/fetch/purge/session-stats: argument validation ──────
+// These commands dispatch to the HTTP daemon (ensureDaemon + callDaemon) for
+// their actual work, so a full round-trip smoke test needs a live daemon and
+// working sandboxed-execution runtimes. That's environment-dependent (network,
+// spawn permissions) and out of scope for a fast local smoke test. What IS
+// deterministic and worth asserting here: the pre-daemon argument validation
+// returns the right usage/exit code WITHOUT ever starting the daemon.
+
+check("execute missing --language → usage, exit 1", () => {
+  const r = cli("execute", "--code", "1");
+  return { ok: r.status === 1 && /Usage: context-mode execute/.test(r.stdout), detail: r.stdout || r.stderr };
+});
+
+check("execute-file missing --language → usage, exit 1", () => {
+  const r = cli("execute-file", fixFile);
+  return { ok: r.status === 1 && /Usage: context-mode execute-file/.test(r.stdout), detail: r.stdout || r.stderr };
+});
+
+check("execute-file missing <path> → usage, exit 1", () => {
+  const r = cli("execute-file", "--language", "javascript", "--code", "1");
+  return { ok: r.status === 1 && /Usage: context-mode execute-file/.test(r.stdout), detail: r.stdout || r.stderr };
+});
+
+check("fetch missing <url> → usage, exit 1", () => {
+  const r = cli("fetch");
+  return { ok: r.status === 1 && /Usage: context-mode fetch/.test(r.stdout), detail: r.stdout || r.stderr };
+});
+
+check("purge --help → usage, exit 0 (no daemon spawn)", () => {
+  const r = cli("purge", "--help");
+  return { ok: r.status === 0 && /Usage: context-mode purge/.test(r.stdout), detail: r.stdout || r.stderr };
+});
+
 // ── summary ───────────────────────────────────────────────────────────────────
 console.log(`\n\x1b[1m── Results ───────────────────────────────────────────────────\x1b[0m`);
 console.log(`${PASS} passed: ${passed}   ${failed > 0 ? FAIL : ""}failed: ${failed}\n`);

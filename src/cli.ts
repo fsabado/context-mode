@@ -278,6 +278,121 @@ async function callDaemon(toolName: string, toolArgs: unknown): Promise<unknown>
   });
 }
 
+/**
+ * Call an MCP tool on the daemon and print its text content.
+ * No in-process fallback here — unlike index/search, these tools' logic
+ * (sandboxed execution, session stats DB, security policy) lives entirely
+ * inside server.ts and isn't worth duplicating for a CLI-only path.
+ */
+async function runDaemonTool(toolName: string, toolArgs: Record<string, unknown>): Promise<number> {
+  try {
+    await ensureDaemon();
+    const result = await callDaemon(toolName, toolArgs) as {
+      content?: Array<{ text: string }>;
+      isError?: boolean;
+    };
+    const text = (result.content ?? []).map((c) => c.text).join("\n\n");
+    if (result.isError) {
+      console.error(text);
+      return 1;
+    }
+    console.log(text);
+    return 0;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`context-mode ${toolName}: ${message}`);
+    return 1;
+  }
+}
+
+/** Code from --code, --code-file <path>, or piped stdin (in that order). */
+function resolveCodeInput(flags: ParsedFlags["flags"]): string | undefined {
+  const inline = stringFlag(flags, "code");
+  if (inline) return inline;
+  const codeFile = stringFlag(flags, "code-file");
+  if (codeFile) return readFileSync(resolve(codeFile), "utf8");
+  if (!process.stdin.isTTY) {
+    try { return readFileSync(0, "utf8"); } catch { return undefined; }
+  }
+  return undefined;
+}
+
+async function executeCommand(argv: string[]): Promise<number> {
+  const parsed = parseFlags(argv);
+  const language = stringFlag(parsed.flags, "language");
+  if (!language || parsed.positional[0] === "-h" || parsed.positional[0] === "--help") {
+    console.log("Usage: context-mode execute --language <lang> [--code <code>|--code-file <path>] [--timeout ms] [--background] [--intent text]");
+    console.log("Languages: javascript, typescript, python, shell, ruby, go, rust, php, perl, r, elixir, csharp");
+    return language ? 0 : 1;
+  }
+  const code = resolveCodeInput(parsed.flags);
+  if (!code) {
+    console.error("context-mode execute: provide --code, --code-file <path>, or pipe code via stdin");
+    return 1;
+  }
+  return runDaemonTool("ctx_execute", {
+    language,
+    code,
+    timeout: numberFlag(parsed.flags, "timeout"),
+    background: boolFlag(parsed.flags, "background"),
+    intent: stringFlag(parsed.flags, "intent"),
+  });
+}
+
+async function executeFileCommand(argv: string[]): Promise<number> {
+  const parsed = parseFlags(argv);
+  const targetPath = parsed.positional[0];
+  const language = stringFlag(parsed.flags, "language");
+  if (!targetPath || targetPath === "-h" || targetPath === "--help" || !language) {
+    console.log("Usage: context-mode execute-file <path> --language <lang> [--code <code>|--code-file <path>] [--timeout ms] [--intent text]");
+    return targetPath && language ? 0 : 1;
+  }
+  const code = resolveCodeInput(parsed.flags);
+  if (!code) {
+    console.error("context-mode execute-file: provide --code, --code-file <path>, or pipe code via stdin");
+    return 1;
+  }
+  return runDaemonTool("ctx_execute_file", {
+    path: isAbsolute(targetPath) ? targetPath : resolve(process.cwd(), targetPath),
+    language,
+    code,
+    timeout: numberFlag(parsed.flags, "timeout"),
+    intent: stringFlag(parsed.flags, "intent"),
+  });
+}
+
+async function fetchCommand(argv: string[]): Promise<number> {
+  const parsed = parseFlags(argv);
+  const url = parsed.positional[0];
+  if (!url || url === "-h" || url === "--help") {
+    console.log("Usage: context-mode fetch <url> [--source label] [--force] [--ttl ms]");
+    return url ? 0 : 1;
+  }
+  return runDaemonTool("ctx_fetch_and_index", {
+    url,
+    source: stringFlag(parsed.flags, "source"),
+    force: boolFlag(parsed.flags, "force"),
+    ttl: numberFlag(parsed.flags, "ttl", { min: 0 }),
+  });
+}
+
+async function purgeCommand(argv: string[]): Promise<number> {
+  const parsed = parseFlags(argv);
+  if (boolFlag(parsed.flags, "help") || parsed.positional[0] === "-h") {
+    console.log("Usage: context-mode purge --confirm --scope <session|project> [--session-id <id>]");
+    return 0;
+  }
+  return runDaemonTool("ctx_purge", {
+    confirm: boolFlag(parsed.flags, "confirm"),
+    scope: stringFlag(parsed.flags, "scope"),
+    sessionId: stringFlag(parsed.flags, "session-id"),
+  });
+}
+
+async function sessionStatsCommand(): Promise<number> {
+  return runDaemonTool("ctx_stats", {});
+}
+
 /* -------------------------------------------------------
  * Entry point
  * ------------------------------------------------------- */
@@ -294,6 +409,29 @@ function printHelp(): void {
     "  context-mode upgrade                 Fix hooks, permissions, and settings",
     "  context-mode hook <platform> <event> Dispatch a configured hook script",
     "  context-mode statusline              Print Claude Code status line",
+    "  context-mode execute                 Run code in a sandboxed subprocess (via daemon)",
+    "  context-mode execute-file <path>     Load a file into the sandbox and run code over it",
+    "  context-mode fetch <url>             Fetch + index a URL into the FTS5 knowledge base",
+    "  context-mode session-stats           Show this session's context-savings stats",
+    "  context-mode purge                   Delete indexed content (--confirm required)",
+    "",
+    "Execute options:",
+    "  --language <lang>                    Required. js/ts/python/shell/ruby/go/rust/php/perl/r/elixir/csharp",
+    "  --code <code>                        Inline source (else --code-file <path>, else stdin)",
+    "  --code-file <path>                   Read source from a file",
+    "  --timeout <ms>                       Max execution time",
+    "  --background                         Keep process running after timeout",
+    "  --intent <text>                      Auto-index large output for later ctx_search",
+    "",
+    "Fetch options:",
+    "  --source <label>                     Source label for the indexed content",
+    "  --force                              Skip cache and re-fetch",
+    "  --ttl <ms>                           Cache freshness window (0 = bypass cache)",
+    "",
+    "Purge options:",
+    "  --confirm                            Required for the delete to proceed",
+    "  --scope <session|project>            Purge scope",
+    "  --session-id <id>                    Session UUID (required with --scope session)",
     "",
     "Index options:",
     "  --source <label>                     Source label (default: project:<directory-name> or path)",
@@ -374,6 +512,16 @@ if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") {
   }
 } else if (args[0] === "insight") {
   insight();
+} else if (args[0] === "execute") {
+  executeCommand(args.slice(1)).then((code) => process.exit(code));
+} else if (args[0] === "execute-file") {
+  executeFileCommand(args.slice(1)).then((code) => process.exit(code));
+} else if (args[0] === "fetch") {
+  fetchCommand(args.slice(1)).then((code) => process.exit(code));
+} else if (args[0] === "purge") {
+  purgeCommand(args.slice(1)).then((code) => process.exit(code));
+} else if (args[0] === "session-stats") {
+  sessionStatsCommand().then((code) => process.exit(code));
 } else if (args[0] === "statusline") {
   // Status line implementation lives in bin/statusline.mjs to keep it
   // dependency-free and fast. Forward stdin and exit with its result.
