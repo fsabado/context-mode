@@ -71,7 +71,7 @@ import { stripJsonComments } from "./util/jsonc.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, pricePerToken } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport, getConversationStats, getContentBytesAllSessions, getConversationWindowStats, getLifetimeStats, getLifetimeStatsGuarded, getMultiAdapterLifetimeStatsGuarded, getRealBytesStats, pricePerToken } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -1097,7 +1097,7 @@ function persistStats(): void {
     let lifetimeTokens = _lifetimeCache?.tokens ?? 0;
     if (!_lifetimeCache || now - _lifetimeCache.computedAt > LIFETIME_REFRESH_MS) {
       try {
-        const life = getLifetimeStats({ sessionsDir: getSessionDir() });
+        const life = getLifetimeStatsGuarded({ sessionsDir: getSessionDir() });
         lifetimeTokens = (life?.totalEvents ?? 0) * TOKENS_PER_EVENT;
         _lifetimeCache = { tokens: lifetimeTokens, computedAt: now };
       } catch {
@@ -4228,13 +4228,13 @@ server.registerTool(
           // non-Claude platforms (Cursor, OpenCode, JetBrains, ...) read
           // from THEIR sessions dir — not the hardcoded ~/.claude/ default.
           // Mirrors the statusline contract at src/server.ts:540.
-          const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
+          const lifetime = getLifetimeStatsGuarded({ sessionsDir: getSessionDir() });
           // B3b Slices 3.2-3.6: cross-adapter aggregation so the renderer
           // can show "Where it came from" + the "across N AI tools"
           // headline. Best-effort — failures absorbed so a corrupt
           // sidecar in any adapter dir cannot break ctx_stats.
           let multiAdapter;
-          try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+          try { multiAdapter = getMultiAdapterLifetimeStatsGuarded(); } catch { /* never block ctx_stats */ }
           // F1: wire conversation + realBytes opts so formatReport renders the
           // narrative 5-section "kitap gibi" layout (timeline, ladder, receipt,
           // example cost, auto-memory). Without these, formatReport falls back
@@ -4353,12 +4353,12 @@ server.registerTool(
         // Lifetime still meaningful (other projects, auto-memory) so include it.
         const engine = new AnalyticsEngine(createMinimalDb());
         const report = engine.queryAll(sessionStats);
-        const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
+        const lifetime = getLifetimeStatsGuarded({ sessionsDir: getSessionDir() });
         if (_detectedAdapter?.name === "Pi") {
           patchPiLifetimeFromStatsFiles(lifetime, getSessionDir());
         }
         let multiAdapter;
-        try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+        try { multiAdapter = getMultiAdapterLifetimeStatsGuarded(); } catch { /* never block ctx_stats */ }
         let indexState;
         try { indexState = getStore().getIndexState(); } catch { /* never block ctx_stats */ }
         text = formatReport(report, VERSION, _latestVersion, { lifetime, multiAdapter, indexState });
@@ -4368,12 +4368,12 @@ server.registerTool(
       const engine = new AnalyticsEngine(createMinimalDb());
       const report = engine.queryAll(sessionStats);
       let lifetime;
-      try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
+      try { lifetime = getLifetimeStatsGuarded({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
       if (_detectedAdapter?.name === "Pi" && lifetime) {
         patchPiLifetimeFromStatsFiles(lifetime, getSessionDir());
       }
       let multiAdapter;
-      try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
+      try { multiAdapter = getMultiAdapterLifetimeStatsGuarded(); } catch { /* never block ctx_stats */ }
       text = formatReport(report, VERSION, _latestVersion, (lifetime || multiAdapter) ? { lifetime, multiAdapter } : undefined);
     }
 

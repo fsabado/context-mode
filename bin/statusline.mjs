@@ -244,7 +244,7 @@ async function main() {
 
   const {
     getRealBytesStats,
-    getMultiAdapterLifetimeStats,
+    getMultiAdapterLifetimeStatsGuarded,
     kb,
   } = analytics;
 
@@ -279,7 +279,7 @@ async function main() {
   // 2+ real adapters are present. Mirrors src/server.ts:2840.
   let multi;
   try {
-    multi = getMultiAdapterLifetimeStats();
+    multi = getMultiAdapterLifetimeStatsGuarded();
   } catch {
     multi = null;
   }

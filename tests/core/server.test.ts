@@ -2568,18 +2568,23 @@ describe("Project dir hash consistency", () => {
     );
     expect(statsMatch).not.toBeNull();
     const body = statsMatch![0];
-    // Every `getLifetimeStats(` invocation inside ctx_stats MUST be argumented
-    // (sessionsDir-aware). A bare `()` call falls back to the hardcoded
-    // ~/.claude/context-mode/sessions default and silently mis-attributes
-    // lifetime counts on non-Claude platforms. Use a negative lookbehind to
-    // exclude `getMultiAdapterLifetimeStats(` whose default is intentional.
+    // Every `getLifetimeStats(`/`getLifetimeStatsGuarded(` invocation inside
+    // ctx_stats MUST be argumented (sessionsDir-aware). A bare `()` call
+    // falls back to the hardcoded ~/.claude/context-mode/sessions default
+    // and silently mis-attributes lifetime counts on non-Claude platforms.
+    // Use a negative lookbehind to exclude `getMultiAdapterLifetimeStats(`
+    // whose default is intentional. `(?:Guarded)?` covers the
+    // subprocess-hardened wrapper ctx_stats now calls (see
+    // getLifetimeStatsGuarded in src/session/analytics.ts) — same
+    // sessionsDir contract, just executed in a disposable child process
+    // with a hard timeout so a wedged NFS/WAL lock can't freeze the daemon.
     const bareCalls = body.match(
-      /(?<!MultiAdapter)getLifetimeStats\(\s*\)/g,
+      /(?<!MultiAdapter)getLifetimeStats(?:Guarded)?\(\s*\)/g,
     );
-    expect(bareCalls, "ctx_stats must not call getLifetimeStats() with no args").toBeNull();
+    expect(bareCalls, "ctx_stats must not call getLifetimeStats()/getLifetimeStatsGuarded() with no args").toBeNull();
     // Should pass an object literal containing `sessionsDir` (mirrors the
     // statusline contract at src/server.ts:540).
-    expect(body).toMatch(/getLifetimeStats\(\s*\{\s*sessionsDir:\s*getSessionDir\(\)/);
+    expect(body).toMatch(/getLifetimeStats(?:Guarded)?\(\s*\{\s*sessionsDir:\s*getSessionDir\(\)/);
   });
 });
 

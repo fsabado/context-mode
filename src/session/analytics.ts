@@ -12,7 +12,8 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
 import { ensureSessionEventsSchema } from "./db.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
@@ -853,6 +854,85 @@ export function getLifetimeStats(opts?: {
   };
 }
 
+function emptyLifetimeStats(): LifetimeStats {
+  return {
+    totalEvents: 0,
+    totalSessions: 0,
+    autoMemoryCount: 0,
+    autoMemoryProjects: 0,
+    autoMemoryByPrefix: {},
+    categoryCounts: {},
+    rescueBytes: 0,
+    firstEventMs: 0,
+    distinctProjects: 0,
+  };
+}
+
+/**
+ * Locate the lifetime-scan worker bundle as a sibling of whatever file is
+ * currently executing this module. analytics.ts is inlined by esbuild into
+ * several different bundles (server.bundle.mjs at the package root,
+ * hooks/session-db.bundle.mjs inside hooks/) plus the unbundled
+ * bin/statusline.mjs — so `import.meta.url` resolves to whichever of those
+ * is calling in, and the worker's location relative to it differs. Try the
+ * shapes that actually occur; first existing match wins.
+ */
+function resolveLifetimeScanWorker(): string | undefined {
+  const selfPath = fileURLToPath(import.meta.url);
+  // Dev/test guard: vitest and tsx import this module as .ts directly, and
+  // its directory (src/session/) resolves the SAME candidate path as the
+  // production build/session/analytics.js case (both are two levels above
+  // the package root's hooks/ dir). Without this check, any test run in a
+  // checkout that happens to have hooks/lifetime-scan.bundle.mjs already
+  // built (e.g. right after `npm run bundle`) would silently start spawning
+  // real subprocesses from unit tests. Only compiled output (.js from tsc,
+  // .mjs from esbuild) is eligible to look for the sibling worker bundle.
+  if (selfPath.endsWith(".ts")) return undefined;
+  const here = dirname(selfPath);
+  const candidates = [
+    join(here, "hooks", "lifetime-scan.bundle.mjs"), // package root (server.bundle.mjs)
+    join(here, "lifetime-scan.bundle.mjs"),          // already inside hooks/
+    join(here, "..", "hooks", "lifetime-scan.bundle.mjs"), // bin/statusline.mjs
+    join(here, "..", "..", "hooks", "lifetime-scan.bundle.mjs"), // build/session/analytics.js (statusline's plain-tsc import)
+  ];
+  return candidates.find((p) => existsSync(p));
+}
+
+const DEFAULT_LIFETIME_SCAN_TIMEOUT_MS = 3000;
+
+/**
+ * Same contract as `getLifetimeStats()`, hardened for production: the real
+ * scan runs in a disposable child process with a hard wall-clock deadline,
+ * so a wedged native SQLite call (see lifetime-scan-worker.ts docstring —
+ * observed on a WAL-mode DB over a network filesystem) gets SIGKILLed
+ * instead of freezing this process. Falls back to running in-process when
+ * the worker bundle isn't present (dev/tsx runs, tests) — those contexts
+ * don't hit the packaged-bundle layout this depends on. Never throws;
+ * degrades to zeroed stats on timeout/kill/parse failure, same as every
+ * other best-effort caller of this module already does on a corrupt file.
+ */
+export function getLifetimeStatsGuarded(
+  opts?: { sessionsDir?: string; memoryRoot?: string },
+  timeoutMs = DEFAULT_LIFETIME_SCAN_TIMEOUT_MS,
+): LifetimeStats {
+  const worker = resolveLifetimeScanWorker();
+  if (!worker) return getLifetimeStats(opts);
+  try {
+    const payload = Buffer.from(
+      JSON.stringify({ kind: "lifetime", opts }),
+    ).toString("base64");
+    const out = execFileSync(process.execPath, [worker, payload], {
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return JSON.parse(out) as LifetimeStats;
+  } catch {
+    return emptyLifetimeStats();
+  }
+}
+
 /**
  * Aggregate every event for one `session_id` across all SessionDB files in
  * `sessionsDir` plus the compact-rescue snapshot bytes from `session_resume`.
@@ -1668,6 +1748,39 @@ export function getMultiAdapterLifetimeStats(opts?: {
   }
 
   return { totalEvents, totalSessions, totalBytes, perAdapter };
+}
+
+function emptyMultiAdapterLifetimeStats(): MultiAdapterLifetimeStats {
+  return { totalEvents: 0, totalSessions: 0, totalBytes: 0, perAdapter: [] };
+}
+
+/**
+ * Same contract as `getMultiAdapterLifetimeStats()`, hardened for
+ * production — see getLifetimeStatsGuarded()/lifetime-scan-worker.ts for
+ * why. This scan is the higher-risk one: it opens every OTHER AI tool's
+ * session DBs too (~/.claude, ~/.cursor, ~/.codex, ...), so it can't be
+ * scoped away via CONTEXT_MODE_DIR the way this project's own DB can.
+ */
+export function getMultiAdapterLifetimeStatsGuarded(
+  opts?: { home?: string; filter?: RealUsageFilter },
+  timeoutMs = DEFAULT_LIFETIME_SCAN_TIMEOUT_MS,
+): MultiAdapterLifetimeStats {
+  const worker = resolveLifetimeScanWorker();
+  if (!worker) return getMultiAdapterLifetimeStats(opts);
+  try {
+    const payload = Buffer.from(
+      JSON.stringify({ kind: "multi-adapter", opts }),
+    ).toString("base64");
+    const out = execFileSync(process.execPath, [worker, payload], {
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return JSON.parse(out) as MultiAdapterLifetimeStats;
+  } catch {
+    return emptyMultiAdapterLifetimeStats();
+  }
 }
 
 /** Aggregated multi-adapter real-bytes stats. */
