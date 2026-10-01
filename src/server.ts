@@ -5257,7 +5257,7 @@ async function startHttpDaemon(port: number): Promise<void> {
     req.on("end", async () => {
       try {
         const { name, arguments: input } = JSON.parse(body) as { name: string; arguments: unknown };
-        type RegisteredTool = { handler: (input: unknown) => Promise<unknown>; enabled: boolean };
+        type RegisteredTool = { handler: (input: unknown) => Promise<unknown>; enabled: boolean; inputSchema?: unknown };
         const tools = (server as unknown as { _registeredTools: Record<string, RegisteredTool> })._registeredTools;
         const tool = tools[name];
         if (!tool || !tool.enabled) {
